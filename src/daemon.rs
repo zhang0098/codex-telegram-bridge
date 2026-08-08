@@ -14,7 +14,6 @@ use crate::codex::{
     filter_watch_events, parse_event_filter, start_codex_watch_receiver, sync_state_from_live,
     watch_events_from_sync_result, watch_thread_error_event, CodexAppServerClient,
 };
-use crate::discord::{deliver_discord_event, process_discord_updates};
 use crate::state::{
     create_state_db, deliver_due_outbound_events, enqueue_outbound_event, pending_outbound_count,
     prune_state_logs, record_transport_delivery, should_emit_for_away_window, state_db_path,
@@ -191,8 +190,7 @@ fn deliver_outbound_events(
 ) -> Result<OutboxDeliverySummary> {
     deliver_due_outbound_events(conn, now, 100, Some(deadline), |event| {
         let event_id = notification_event_id(event);
-        let telegram =
-            if let Some(telegram) = config.telegram.as_ref().filter(|telegram| telegram.enabled) {
+        let telegram = if let Some(telegram) = config.telegram.as_ref() {
                 if transport_delivery_exists(conn, &event_id, "telegram")? {
                     json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
                 } else {
@@ -203,19 +201,7 @@ fn deliver_outbound_events(
             } else {
                 Value::Null
             };
-        let discord =
-            if let Some(discord) = config.discord.as_ref().filter(|discord| discord.enabled) {
-                if transport_delivery_exists(conn, &event_id, "discord")? {
-                    json!({ "ok": true, "transport": "discord", "skipped": "already_delivered" })
-                } else {
-                    let result = deliver_discord_event(conn, discord, event, now, timeout)?;
-                    record_transport_delivery(conn, &event_id, "discord", &result, now)?;
-                    result
-                }
-            } else {
-                Value::Null
-            };
-        Ok(json!({ "telegram": telegram, "discord": discord }))
+        Ok(json!({ "telegram": telegram }))
     })
 }
 
@@ -232,7 +218,7 @@ fn daemon_cycle(
     let deadline = Instant::now() + daemon_cycle_budget(timeout);
     let filter = parse_event_filter(Some(&config.events));
     let backend = reconcile_daemon_backend(conn, config, now);
-    let telegram_updates = match config.telegram.as_ref().filter(|telegram| telegram.enabled) {
+    let telegram_updates = match config.telegram.as_ref() {
         Some(telegram) => {
             let mut result =
                 match process_telegram_updates(conn, config, now, timeout, Some(deadline)) {
@@ -285,17 +271,6 @@ fn daemon_cycle(
     } else {
         OutboxDeliverySummary::default()
     };
-    let discord_updates = match config.discord.as_ref().filter(|discord| discord.enabled) {
-        Some(_) => match process_discord_updates(conn, config, now, timeout) {
-            Ok(result) => result,
-            Err(error) => json!({
-                "ok": false,
-                "transport": "discord",
-                "error": format!("{error:#}")
-            }),
-        },
-        None => Value::Null,
-    };
     Ok(json!({
         "ok": true,
         "action": "daemon_cycle",
@@ -304,7 +279,6 @@ fn daemon_cycle(
         "backend": backend,
         "delivery": delivery,
         "telegramUpdates": telegram_updates,
-        "discordUpdates": discord_updates,
         "pending": pending_outbound_count(conn)?
     }))
 }
@@ -323,7 +297,6 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
     let telegram_commands = config
         .telegram
         .as_ref()
-        .filter(|telegram| telegram.enabled)
         .map(|telegram| {
             telegram_set_my_commands(telegram, timeout)
                 .map(|_| json!({ "registered": true }))
@@ -1041,50 +1014,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_delivery_skips_disabled_telegram_transport() {
-        let conn = create_state_db_in_memory().expect("db");
-        let event = json!({
-            "type": "thread_waiting",
-            "threadId": "thr_1",
-            "updatedAt": 1500
-        });
-        enqueue_outbound_event(&conn, &event, 2000).expect("enqueue event");
-        let config = DaemonConfig {
-            version: 4,
-            bridge_command: "bridge".to_string(),
-            events: "thread_waiting".to_string(),
-            telegram: Some(crate::TelegramConfig {
-                bot_token: "123:secret".to_string(),
-                chat_id: "456".to_string(),
-                allowed_user_id: None,
-                enabled: false,
-            }),
-            discord: None,
-            codex: Some(crate::CodexConfig {
-                live_mode: crate::CodexLiveMode::Shared,
-                websocket_url: "ws://127.0.0.1:9".to_string(),
-            }),
-            projects: Vec::new(),
-        };
-
-        let summary = deliver_outbound_events(
-            &conn,
-            &config,
-            3000,
-            Duration::from_millis(10),
-            Instant::now() + Duration::from_secs(5),
-        )
-        .expect("deliver disabled transport");
-
-        assert_eq!(summary.attempted, 1);
-        assert_eq!(summary.delivered, 1);
-        assert!(
-            !transport_delivery_exists(&conn, &notification_event_id(&event), "telegram")
-                .expect("delivery lookup")
-        );
-    }
-
-    #[test]
     fn daemon_cycle_reports_backend_error_when_shared_backend_is_unreachable() {
         let conn = create_state_db_in_memory().expect("db");
         let config = DaemonConfig {
@@ -1092,7 +1021,6 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: "thread_error".to_string(),
             telegram: None,
-            discord: None,
             codex: Some(crate::CodexConfig {
                 live_mode: crate::CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
@@ -1116,7 +1044,6 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: "thread_error".to_string(),
             telegram: None,
-            discord: None,
             codex: Some(crate::CodexConfig {
                 live_mode: crate::CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
@@ -1144,7 +1071,6 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: "thread_error".to_string(),
             telegram: None,
-            discord: None,
             codex: Some(crate::CodexConfig {
                 live_mode: crate::CodexLiveMode::Shared,
                 websocket_url,

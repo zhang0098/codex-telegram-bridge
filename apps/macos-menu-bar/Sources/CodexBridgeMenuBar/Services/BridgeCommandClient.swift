@@ -36,16 +36,6 @@ struct BridgeCommandClient {
         try await runStatus(arguments: ["remote", "repair"])
     }
 
-    func setTelegramEnabled(_ enabled: Bool) async throws -> BridgeStatus {
-        _ = try await runJSON(arguments: ["telegram", enabled ? "enable" : "disable"], as: GenericBridgePayload.self)
-        return try await status()
-    }
-
-    func setDiscordEnabled(_ enabled: Bool) async throws -> BridgeStatus {
-        _ = try await runJSON(arguments: ["discord", enabled ? "enable" : "disable"], as: GenericBridgePayload.self)
-        return try await status()
-    }
-
     private func runStatus(arguments: [String]) async throws -> BridgeStatus {
         let payload = try await runJSON(arguments: arguments, as: BridgeStatusPayload.self)
         return BridgeStatus(payload: payload)

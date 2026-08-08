@@ -1991,7 +1991,6 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             },
         )
         .expect("extract command prompt reply")
@@ -2021,7 +2020,6 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             },
         )
         .expect("route")
@@ -2062,7 +2060,6 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             },
         )
         .expect("route")

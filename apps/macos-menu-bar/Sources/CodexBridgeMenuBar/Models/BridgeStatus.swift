@@ -15,9 +15,6 @@ struct BridgeStatus: Equatable {
     var backendError: String?
     var pendingNotifications: Int
     var telegramConfigured: Bool
-    var telegramEnabled: Bool
-    var discordConfigured: Bool
-    var discordEnabled: Bool
     var configPath: String?
     var stateFolderPath: String?
     var detail: String
@@ -30,9 +27,6 @@ struct BridgeStatus: Equatable {
         backendError: nil,
         pendingNotifications: 0,
         telegramConfigured: false,
-        telegramEnabled: false,
-        discordConfigured: false,
-        discordEnabled: false,
         configPath: nil,
         stateFolderPath: nil,
         detail: "Loading"
@@ -49,9 +43,6 @@ struct BridgeStatus: Equatable {
         self.backendError = self.backendRequired ? payload.backend?.lastError : nil
         self.pendingNotifications = payload.pending ?? 0
         self.telegramConfigured = payload.telegramConfigured ?? false
-        self.telegramEnabled = payload.telegramEnabled ?? false
-        self.discordConfigured = payload.discordConfigured ?? false
-        self.discordEnabled = payload.discordEnabled ?? false
         self.configPath = payload.configPath
         self.stateFolderPath = payload.stateFolderPath
 
@@ -78,9 +69,6 @@ struct BridgeStatus: Equatable {
         backendError: String?,
         pendingNotifications: Int,
         telegramConfigured: Bool,
-        telegramEnabled: Bool,
-        discordConfigured: Bool,
-        discordEnabled: Bool,
         configPath: String?,
         stateFolderPath: String?,
         detail: String
@@ -92,9 +80,6 @@ struct BridgeStatus: Equatable {
         self.backendError = backendError
         self.pendingNotifications = pendingNotifications
         self.telegramConfigured = telegramConfigured
-        self.telegramEnabled = telegramEnabled
-        self.discordConfigured = discordConfigured
-        self.discordEnabled = discordEnabled
         self.configPath = configPath
         self.stateFolderPath = stateFolderPath
         self.detail = detail
@@ -105,9 +90,6 @@ struct BridgeStatusPayload: Decodable {
     let configured: Bool?
     let codexConfigured: Bool?
     let telegramConfigured: Bool?
-    let telegramEnabled: Bool?
-    let discordConfigured: Bool?
-    let discordEnabled: Bool?
     let away: BridgeAwayPayload?
     let backend: BridgeBackendPayload?
     let pending: Int?

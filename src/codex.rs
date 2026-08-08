@@ -1968,7 +1968,6 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: "final_answer".to_string(),
             telegram: None,
-            discord: None,
             codex: None,
             projects: Vec::new(),
         };

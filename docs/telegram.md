@@ -206,16 +206,13 @@ When `/new` succeeds, the bridge sends the selected project `cwd` into `thread/s
 
 Use a Telegram bot token dedicated to this bridge. Telegram update delivery should have one owner. If the same token is already used by another process or webhook, direct reply routing becomes ambiguous and unreliable.
 
-## Status And Disable
+## Status
 
 ```bash
 codex-telegram-bridge telegram status
-codex-telegram-bridge telegram enable
-codex-telegram-bridge telegram disable --dry-run
-codex-telegram-bridge telegram disable
 ```
 
-Disabling Telegram pauses Telegram delivery and bot polling without deleting the bot token, chat id, Discord setup, or shared Codex backend config. Re-enable it with `telegram enable`, the menu bar app, or `/telegram_on` from an enabled bot channel.
+Telegram delivery and bot polling always run when the daemon is active. There is no transport-level off switch: to stop the channel, stop the daemon (`daemon stop`) or remove the Telegram section from `~/.codex-telegram-bridge/config.json` and restart it.
 
 ## Security Notes
 
@@ -229,9 +226,8 @@ Disabling Telegram pauses Telegram delivery and bot polling without deleting the
 If the Telegram bot token is exposed or you want to rotate it:
 
 1. revoke or rotate the token with `@BotFather`
-2. run `codex-telegram-bridge telegram disable` if you want to remove the old local config immediately
-3. run `codex-telegram-bridge setup --bot-token <new-token>` or `codex-telegram-bridge telegram setup --bot-token <new-token>`
-4. restart the daemon if you rotated the token without rerunning the full `setup` flow
+2. run `codex-telegram-bridge setup --bot-token <new-token>` or `codex-telegram-bridge telegram setup --bot-token <new-token>`
+3. restart the daemon if you rotated the token without rerunning the full `setup` flow
 
 The bridge does not keep historical token versions. Once the config file is replaced, only the latest token remains on disk.
 
@@ -245,10 +241,6 @@ The local bridge state lives under `~/.codex-telegram-bridge/` and typically con
 
 Retention is local and indefinite until you delete or replace those files.
 
-To remove only the Telegram config:
-
-```bash
-codex-telegram-bridge telegram disable
-```
+To remove only the Telegram config, stop the daemon, delete the `telegram` section from `config.json` (or remove the file to clear everything), and start the daemon again.
 
 To remove all local bridge state, stop the daemon first and then delete `~/.codex-telegram-bridge/`.

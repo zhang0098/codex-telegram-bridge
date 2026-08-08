@@ -87,10 +87,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(actionItem("Refresh Status", #selector(refreshFromMenu(_:)), enabled: !isWorking))
 
         menu.addItem(.separator())
-        menu.addItem(telegramChannelActionItem())
-        menu.addItem(discordChannelActionItem())
-
-        menu.addItem(.separator())
         menu.addItem(actionItem("Open Config File", #selector(openConfig(_:)), enabled: status.configPath != nil))
         menu.addItem(actionItem("Open State Folder", #selector(openStateFolder(_:)), enabled: status.stateFolderPath != nil))
 
@@ -123,16 +119,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func telegramChannelActionItem() -> NSMenuItem {
-        let title = status.telegramEnabled ? "Disable Telegram" : "Enable Telegram"
-        return actionItem(title, #selector(toggleTelegram(_:)), enabled: !isWorking && status.telegramConfigured)
-    }
-
-    private func discordChannelActionItem() -> NSMenuItem {
-        let title = status.discordEnabled ? "Disable Discord" : "Enable Discord"
-        return actionItem(title, #selector(toggleDiscord(_:)), enabled: !isWorking && status.discordConfigured)
-    }
-
     @objc private func turnAway(_ sender: NSMenuItem) {
         Task { await runAction { try await self.client.turnAway() } }
     }
@@ -143,14 +129,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func repair(_ sender: NSMenuItem) {
         Task { await runAction { try await self.client.repair() } }
-    }
-
-    @objc private func toggleTelegram(_ sender: NSMenuItem) {
-        Task { await runAction { try await self.client.setTelegramEnabled(!self.status.telegramEnabled) } }
-    }
-
-    @objc private func toggleDiscord(_ sender: NSMenuItem) {
-        Task { await runAction { try await self.client.setDiscordEnabled(!self.status.discordEnabled) } }
     }
 
     @objc private func refreshFromMenu(_ sender: NSMenuItem) {
@@ -387,9 +365,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var channelTitle: String {
-        let telegram = status.telegramConfigured ? (status.telegramEnabled ? "Telegram On" : "Telegram Off") : "Telegram Setup"
-        let discord = status.discordConfigured ? (status.discordEnabled ? "Discord On" : "Discord Off") : "Discord Setup"
-        return "Channels: \(telegram), \(discord)"
+        let telegram = status.telegramConfigured ? "Telegram On" : "Telegram Setup"
+        return "Channel: \(telegram)"
     }
 
     private var currentIssue: String? {

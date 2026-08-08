@@ -7,21 +7,20 @@ This project is a fork of [HanifCarroll/codex-telegram-bridge](https://github.co
 The product rule is simple:
 
 - when you are present at your computer, Codex does not send remote notifications
-- when you send `/away` in Telegram or Discord, the bridge starts the shared local Codex backend and turns remote mode on
-- replying directly to a bridge-sent Telegram or Discord message sends that reply back to the originating Codex thread
+- when you send `/away` in Telegram, the bridge starts the shared local Codex backend and turns remote mode on
+- replying directly to a bridge-sent Telegram message sends that reply back to the originating Codex thread
 - `/back` stops outbound remote notifications again
 
 Hermes is optional. It uses the local MCP server when you ask an agent to inspect, reply to, or approve Codex work. Hermes and MCP do not own notification delivery.
 
-You do not need Hermes for the default product flow. A normal install is Codex plus Telegram or Discord plus the local daemon. Add Hermes only if you also want a Hermes agent to call the bridge tools directly.
+You do not need Hermes for the default product flow. A normal install is Codex plus Telegram plus the local daemon. Add Hermes only if you also want a Hermes agent to call the bridge tools directly.
 
 ## Core Product Surface
 
 - Product setup: `setup`
 - Presence gate: `away on`, `away off`, `away status`
 - Full remote mode gate: `remote on`, `remote off`, `remote repair`, `remote status`
-- Direct Telegram transport: `telegram setup/status/test/enable/disable`
-- Direct Discord transport: `discord setup/status/test/enable/disable`
+- Direct Telegram transport: `telegram setup/status/test`
 - Telegram remote controls: `/away`, `/back`, `/repair`, `/status`, `/threads`, `/help`, `/new`, `/project`
 - Native macOS companion: `apps/macos-menu-bar`
 - Proactive daemon: `daemon run/install/start/stop/status/logs`
@@ -35,7 +34,7 @@ Advanced commands such as `sync`, `follow`, `watch`, `new`, `fork`, `archive`, `
 
 MCP is an optional local adapter for Hermes and other trusted agent clients. It exposes only `doctor`, `threads`, `inbox`, `waiting`, `show`, `reply`, and `approve` through `codex-telegram-bridge mcp`.
 
-MCP does not send proactive notifications, install the daemon, configure Telegram or Discord, read transport updates, or expose the advanced event stream. Use `setup`, `away`, and the daemon for the remote-control product flow.
+MCP does not send proactive notifications, install the daemon, configure Telegram, read transport updates, or expose the advanced event stream. Use `setup`, `away`, and the daemon for the remote-control product flow.
 
 ## Install
 
@@ -85,20 +84,6 @@ codex-telegram-bridge setup --bot-token <telegram-bot-token>
 
 No Hermes setup is required for Telegram notifications or Telegram replies.
 
-To use Discord instead, create a new Discord application/bot, invite it to the target server/channel, then configure the bridge:
-
-```bash
-codex-telegram-bridge discord setup \
-  --bot-token <discord-bot-token> \
-  --channel-id <discord-channel-id>
-
-# add more Discord targets by repeating --channel-id
-codex-telegram-bridge discord setup \
-  --bot-token <discord-bot-token> \
-  --channel-id <openclaw-agent-channel-id> \
-  --channel-id <hermes-agent-channel-id>
-```
-
 For non-interactive setup:
 
 ```bash
@@ -146,12 +131,12 @@ The daemon runs locally. Each cycle:
 1. syncs Codex thread state through the configured shared websocket backend
 2. checks the local away state
 3. enqueues new notification events only when away is on
-4. sends queued events to Telegram and/or Discord
-5. processes Telegram updates and Discord channel replies
+4. sends queued events to Telegram
+5. processes Telegram updates and replies
 
-Inbound Telegram and Discord replies are processed whenever the daemon is running and the shared live backend is reachable. Reply and approval handling starts the Codex turn and returns immediately; completed answers are picked up by the next daemon sync and delivered through the normal outbound notification path. The away gate only controls outbound notifications.
+Inbound Telegram replies are processed whenever the daemon is running and the shared live backend is reachable. Reply and approval handling starts the Codex turn and returns immediately; completed answers are picked up by the next daemon sync and delivered through the normal outbound notification path. The away gate only controls outbound notifications.
 
-When an inbound reply, approval, or remote `/new` prompt starts a Codex turn, the daemon refreshes the platform typing indicator so Telegram and Discord show that the bot is working until the answer is delivered or the short-lived typing window expires.
+When an inbound reply, approval, or remote `/new` prompt starts a Codex turn, the daemon refreshes the platform typing indicator so Telegram shows that the bot is working until the answer is delivered or the short-lived typing window expires.
 
 Telegram notifications use a compact header, keep Codex's answer body verbatim, and omit internal thread ids. To continue the conversation remotely, use Telegram's Reply action on the specific Codex notification.
 
@@ -162,7 +147,6 @@ If replies stop reaching Codex, send `/repair` in Telegram. It restarts the shar
 Telegram-created threads run in an explicit registered project working directory. Set the current project from Telegram with `/project <id>`, inspect choices with `/project`, or manage the registry locally with `codex-telegram-bridge projects ...`.
 
 Use a Telegram bot token dedicated to this bridge. Telegram update delivery should have one owner.
-Use a new Discord bot dedicated to this bridge when configuring Discord.
 
 ## Commands
 
@@ -241,25 +225,9 @@ codex-telegram-bridge telegram setup \
   --allowed-user-id <telegram-user-id>
 codex-telegram-bridge telegram test --message "test"
 codex-telegram-bridge telegram status
-codex-telegram-bridge telegram enable
-codex-telegram-bridge telegram disable
 ```
 
 See [docs/telegram.md](docs/telegram.md).
-
-### Discord
-
-```bash
-codex-telegram-bridge discord setup \
-  --bot-token <discord-bot-token> \
-  --channel-id <discord-channel-id>
-codex-telegram-bridge discord test --message "test"
-codex-telegram-bridge discord status
-codex-telegram-bridge discord enable
-codex-telegram-bridge discord disable
-```
-
-See [docs/discord.md](docs/discord.md).
 
 Release mechanics are documented in [docs/releasing.md](docs/releasing.md).
 

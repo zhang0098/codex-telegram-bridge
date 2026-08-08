@@ -54,10 +54,6 @@ enum TelegramInboundCommand {
     Back,
     Repair,
     Status,
-    TelegramOn,
-    TelegramOff,
-    DiscordOn,
-    DiscordOff,
     Threads(Option<String>),
     NewThread(Option<String>),
     Project(Option<String>),
@@ -124,7 +120,6 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
-            enabled: true,
         }
     } else if options.dry_run {
         TelegramConfig {
@@ -135,7 +130,6 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
-            enabled: true,
         }
     } else {
         discover_telegram_pairing(&bot_token, options.pair_timeout_ms)?
@@ -202,7 +196,6 @@ pub(crate) fn telegram_status_result() -> Result<Value> {
         "action": "telegram_status",
         "configPath": daemon_config_path()?.display().to_string(),
         "configured": telegram.is_some(),
-        "enabled": telegram.map(|telegram| telegram.enabled).unwrap_or(false),
         "config": config.as_ref().map(redacted_daemon_config)
     }))
 }
@@ -264,38 +257,6 @@ pub(crate) fn telegram_test_result(
         "messageId": sent.pointer("/result/message_id").cloned().unwrap_or(Value::Null)
     }))
 }
-
-pub(crate) fn telegram_set_enabled_result(enabled: bool, dry_run: bool) -> Result<Value> {
-    let path = daemon_config_path()?;
-    let mut config =
-        read_daemon_config_raw()?.context("daemon config is missing. Run telegram setup first.")?;
-    let telegram = config
-        .telegram
-        .as_mut()
-        .context("Telegram is not configured. Run telegram setup first.")?;
-    let previous_enabled = telegram.enabled;
-    telegram.enabled = enabled;
-    if !dry_run {
-        write_daemon_config(&config)?;
-    }
-    Ok(json!({
-        "ok": true,
-        "action": if enabled { "telegram_enable" } else { "telegram_disable" },
-        "dryRun": dry_run,
-        "configured": true,
-        "previousEnabled": previous_enabled,
-        "enabled": enabled,
-        "configPath": path.display().to_string(),
-        "config": redacted_daemon_config(&config)
-    }))
-}
-
-#[cfg(test)]
-#[cfg(test)]
-pub(crate) fn telegram_disable_result(dry_run: bool) -> Result<Value> {
-    telegram_set_enabled_result(false, dry_run)
-}
-
 fn discover_telegram_pairing(bot_token: &str, timeout_ms: u64) -> Result<TelegramConfig> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(1));
     let mut offset = None;
@@ -317,7 +278,6 @@ fn discover_telegram_pairing(bot_token: &str, timeout_ms: u64) -> Result<Telegra
                     bot_token: bot_token.to_string(),
                     chat_id,
                     allowed_user_id,
-                    enabled: true,
                 });
             }
         }
@@ -363,10 +323,6 @@ fn parse_telegram_command_text(text: &str) -> Option<TelegramInboundCommand> {
         "/back" => Some(TelegramInboundCommand::Back),
         "/repair" => Some(TelegramInboundCommand::Repair),
         "/status" => Some(TelegramInboundCommand::Status),
-        "/telegram_on" => Some(TelegramInboundCommand::TelegramOn),
-        "/telegram_off" => Some(TelegramInboundCommand::TelegramOff),
-        "/discord_on" => Some(TelegramInboundCommand::DiscordOn),
-        "/discord_off" => Some(TelegramInboundCommand::DiscordOff),
         "/threads" => Some(TelegramInboundCommand::Threads(rest.map(str::to_string))),
         "/new" => Some(TelegramInboundCommand::NewThread(rest.map(str::to_string))),
         "/project" => Some(TelegramInboundCommand::Project(rest.map(str::to_string))),
@@ -1179,34 +1135,6 @@ fn execute_telegram_command(
             let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
         }
-        TelegramInboundCommand::TelegramOn => {
-            let state = telegram_set_enabled_result(true, false)?;
-            let sent = telegram_send_text(telegram, "Telegram channel is enabled.", timeout)?;
-            Ok(
-                json!({ "ok": true, "action": "telegram_enable_command", "state": state, "sent": sent }),
-            )
-        }
-        TelegramInboundCommand::TelegramOff => {
-            let state = telegram_set_enabled_result(false, false)?;
-            let sent = telegram_send_text(telegram, "Telegram channel is disabled.", timeout)?;
-            Ok(
-                json!({ "ok": true, "action": "telegram_disable_command", "state": state, "sent": sent }),
-            )
-        }
-        TelegramInboundCommand::DiscordOn => {
-            let state = crate::discord::discord_set_enabled_result(true, false)?;
-            let sent = telegram_send_text(telegram, "Discord channel is enabled.", timeout)?;
-            Ok(
-                json!({ "ok": true, "action": "discord_enable_command", "state": state, "sent": sent }),
-            )
-        }
-        TelegramInboundCommand::DiscordOff => {
-            let state = crate::discord::discord_set_enabled_result(false, false)?;
-            let sent = telegram_send_text(telegram, "Discord channel is disabled.", timeout)?;
-            Ok(
-                json!({ "ok": true, "action": "discord_disable_command", "state": state, "sent": sent }),
-            )
-        }
         TelegramInboundCommand::Threads(raw_limit) => execute_threads_command(
             conn, telegram, raw_limit, now, timeout, deadline,
         )
@@ -1982,41 +1910,6 @@ mod tests {
     }
 
     #[test]
-    fn telegram_disable_dry_run_reports_state_without_deleting_file() {
-        let _guard = config_test_lock().lock().expect("config lock");
-        let _backup = ConfigBackup::capture().expect("capture config backup");
-        let path = write_daemon_config(&DaemonConfig {
-            version: 4,
-            bridge_command: "codex-telegram-bridge".to_string(),
-            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
-            telegram: Some(TelegramConfig {
-                bot_token: "123:secret".to_string(),
-                chat_id: "456".to_string(),
-                allowed_user_id: Some("789".to_string()),
-                enabled: true,
-            }),
-            discord: None,
-            codex: Some(CodexConfig {
-                live_mode: CodexLiveMode::Shared,
-                websocket_url: "ws://127.0.0.1:4500".to_string(),
-            }),
-            projects: Vec::new(),
-        })
-        .expect("write config");
-
-        let result = telegram_disable_result(true).expect("telegram disable dry run");
-
-        assert_eq!(result["action"], "telegram_disable");
-        assert_eq!(result["dryRun"], true);
-        assert_eq!(result["configured"], true);
-        assert_eq!(result["previousEnabled"], true);
-        assert_eq!(result["enabled"], false);
-        assert_eq!(result["configPath"], path.display().to_string());
-        assert_eq!(result["config"]["telegram"]["enabled"], false);
-        assert!(path.exists(), "dry run should leave config in place");
-    }
-
-    #[test]
     fn telegram_command_parser_supports_core_commands() {
         assert_eq!(
             parse_telegram_command_text("/away"),
@@ -2078,7 +1971,6 @@ mod tests {
             bot_token: "123:secret".to_string(),
             chat_id: "456".to_string(),
             allowed_user_id: Some("789".to_string()),
-            enabled: true,
         };
 
         let command = extract_telegram_command(
@@ -2125,7 +2017,6 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
             telegram: None,
-            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: server.url.clone(),
@@ -2175,7 +2066,6 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
             telegram: None,
-            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: server.url.clone(),
@@ -2233,9 +2123,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             }),
-            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: websocket_url.clone(),
@@ -2248,7 +2136,6 @@ mod tests {
             bot_token: "123:secret".to_string(),
             chat_id: "456".to_string(),
             allowed_user_id: Some("789".to_string()),
-            enabled: true,
         };
         let message = json!({
             "chat": { "id": "456" },
@@ -2322,7 +2209,6 @@ mod tests {
             bot_token: "123:secret".to_string(),
             chat_id: "456".to_string(),
             allowed_user_id: Some("789".to_string()),
-            enabled: true,
         };
         let message = json!({
             "chat": { "id": "456" },
@@ -2360,9 +2246,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             }),
-            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
@@ -2374,20 +2258,32 @@ mod tests {
         let telegram = config.telegram.clone().expect("telegram config");
         let bot_id = telegram_bot_id(&telegram.bot_token);
         let key = format!("telegram_offset:{bot_id}");
+        // Route message id 10 to a thread so the reply update starts a Codex turn,
+        // which fails because the shared backend is unreachable in this test env.
+        crate::state::insert_telegram_message_route(
+            &conn,
+            "456",
+            10,
+            "thr_failing",
+            "test-event",
+            0,
+        )
+        .expect("insert route");
         let updates = vec![
             json!({
                 "update_id": 1,
                 "message": {
-                    "message_id": 10,
+                    "message_id": 11,
                     "chat": { "id": "456" },
                     "from": { "id": "789" },
-                    "text": "/discord_on"
+                    "reply_to_message": { "message_id": 10 },
+                    "text": "continue please"
                 }
             }),
             json!({
                 "update_id": 2,
                 "message": {
-                    "message_id": 11,
+                    "message_id": 12,
                     "chat": { "id": "456" },
                     "from": { "id": "789" },
                     "text": "plain message"
@@ -2408,10 +2304,11 @@ mod tests {
         )
         .expect("first batch");
 
-        // /discord_on fails (Discord is not configured) but is acked as an error,
-        // and the later message is still processed: the channel does not wedge.
+        // The routed reply fails (the shared backend is unreachable) but is acked
+        // as an error, and the later message is still processed: the channel does
+        // not wedge.
         assert_eq!(first["failed"], 1);
-        assert_eq!(first["commands"], 0);
+        assert_eq!(first["replies"], 0);
         assert_eq!(first["ignored"], 1);
         assert_eq!(
             get_setting_number(&conn, &key)
@@ -2472,14 +2369,12 @@ mod tests {
             bot_token: "123:secret".to_string(),
             chat_id: "456".to_string(),
             allowed_user_id: Some("789".to_string()),
-            enabled: true,
         };
         let config = DaemonConfig {
             version: 4,
             bridge_command: "bridge".to_string(),
             events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
             telegram: Some(telegram.clone()),
-            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
@@ -2555,7 +2450,6 @@ mod tests {
             bot_token: "123:secret".to_string(),
             chat_id: "456".to_string(),
             allowed_user_id: Some("789".to_string()),
-            enabled: true,
         };
         insert_telegram_callback_route(
             &conn,

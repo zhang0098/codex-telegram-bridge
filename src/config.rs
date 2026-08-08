@@ -17,8 +17,6 @@ pub(crate) struct DaemonConfig {
     #[serde(default)]
     pub(crate) telegram: Option<TelegramConfig>,
     #[serde(default)]
-    pub(crate) discord: Option<DiscordConfig>,
-    #[serde(default)]
     pub(crate) codex: Option<CodexConfig>,
     #[serde(default)]
     pub(crate) projects: Vec<RegisteredProject>,
@@ -44,34 +42,6 @@ pub(crate) struct TelegramConfig {
     pub(crate) chat_id: String,
     #[serde(default)]
     pub(crate) allowed_user_id: Option<String>,
-    #[serde(default = "transport_enabled_default")]
-    pub(crate) enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DiscordConfig {
-    pub(crate) bot_token: String,
-    #[serde(default)]
-    pub(crate) channel_id: String,
-    #[serde(default)]
-    pub(crate) channel_ids: Vec<String>,
-    #[serde(default)]
-    pub(crate) allowed_user_id: Option<String>,
-    #[serde(default = "transport_enabled_default")]
-    pub(crate) enabled: bool,
-}
-
-fn transport_enabled_default() -> bool {
-    true
-}
-
-pub(crate) fn telegram_config_enabled(telegram: Option<&TelegramConfig>) -> bool {
-    telegram.map(|telegram| telegram.enabled).unwrap_or(false)
-}
-
-pub(crate) fn discord_config_enabled(discord: Option<&DiscordConfig>) -> bool {
-    discord.map(|discord| discord.enabled).unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,32 +64,6 @@ pub(crate) struct TelegramSetupOptions<'a> {
     pub(crate) websocket_url: &'a str,
     pub(crate) dry_run: bool,
     pub(crate) pair_timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DiscordSetupOptions<'a> {
-    pub(crate) bot_token: Option<&'a str>,
-    pub(crate) channel_ids: &'a [String],
-    pub(crate) allowed_user_id: Option<&'a str>,
-    pub(crate) events: &'a str,
-    pub(crate) bridge_command: &'a str,
-    pub(crate) websocket_url: &'a str,
-    pub(crate) dry_run: bool,
-}
-
-pub(crate) fn discord_config_channel_ids(discord: &DiscordConfig) -> Vec<&str> {
-    let mut channels = Vec::new();
-    let primary = discord.channel_id.trim();
-    if !primary.is_empty() {
-        channels.push(primary);
-    }
-    for channel_id in &discord.channel_ids {
-        let channel_id = channel_id.trim();
-        if !channel_id.is_empty() && !channels.contains(&channel_id) {
-            channels.push(channel_id);
-        }
-    }
-    channels
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -169,7 +113,6 @@ pub(crate) fn merged_daemon_config(
         bridge_command: bridge_command.to_string(),
         events: events.to_string(),
         telegram: Some(telegram),
-        discord: existing.and_then(|config| config.discord.clone()),
         codex: Some(codex),
         projects: existing
             .map(|config| config.projects.clone())
@@ -209,17 +152,9 @@ pub(crate) fn load_daemon_config() -> Result<DaemonConfig> {
             bail!("daemon config telegram.chatId cannot be empty");
         }
     }
-    if let Some(discord) = config.discord.as_ref() {
-        if discord.bot_token.trim().is_empty() {
-            bail!("daemon config discord.botToken cannot be empty");
-        }
-        if discord_config_channel_ids(discord).is_empty() {
-            bail!("daemon config discord.channelIds cannot be empty");
-        }
-    }
-    if config.telegram.is_none() && config.discord.is_none() {
+    if config.telegram.is_none() {
         bail!(
-            "daemon config must include a notification transport. Run `codex-telegram-bridge telegram setup` or `codex-telegram-bridge discord setup`."
+            "daemon config must include Telegram configuration. Run `codex-telegram-bridge telegram setup`."
         );
     }
     let codex = config
@@ -257,15 +192,7 @@ pub(crate) fn redacted_daemon_config(config: &DaemonConfig) -> Value {
         "telegram": config.telegram.as_ref().map(|telegram| json!({
             "botToken": "<redacted>",
             "chatId": telegram.chat_id,
-            "allowedUserId": telegram.allowed_user_id,
-            "enabled": telegram.enabled
-        })),
-        "discord": config.discord.as_ref().map(|discord| json!({
-            "botToken": "<redacted>",
-            "channelId": discord.channel_id,
-            "channelIds": discord_config_channel_ids(discord),
-            "allowedUserId": discord.allowed_user_id,
-            "enabled": discord.enabled
+            "allowedUserId": telegram.allowed_user_id
         })),
         "projects": config.projects.iter().map(|project| json!({
             "id": project.id,
@@ -274,22 +201,6 @@ pub(crate) fn redacted_daemon_config(config: &DaemonConfig) -> Value {
             "aliases": project.aliases
         })).collect::<Vec<_>>()
     })
-}
-
-pub(crate) fn resolve_discord_bot_token(explicit: Option<&str>) -> Result<String> {
-    explicit
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            env::var("DISCORD_BOT_TOKEN")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-        .context(
-            "Discord bot token is required. Pass --bot-token or set DISCORD_BOT_TOKEN after creating a new bot in the Discord Developer Portal.",
-        )
 }
 
 pub(crate) fn read_daemon_config_raw() -> Result<Option<DaemonConfig>> {
@@ -374,9 +285,7 @@ mod tests {
                     bot_token: "old".to_string(),
                     chat_id: "old-chat".to_string(),
                     allowed_user_id: None,
-                    enabled: true,
                 }),
-                discord: None,
                 codex: Some(CodexConfig {
                     live_mode: CodexLiveMode::Shared,
                     websocket_url: "ws://127.0.0.1:4500".to_string(),
@@ -394,7 +303,6 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             },
             CodexConfig {
                 live_mode: CodexLiveMode::Shared,
@@ -421,9 +329,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             }),
-            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:4500".to_string(),
@@ -450,9 +356,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             }),
-            discord: None,
             codex: None,
             projects: vec![],
         })
@@ -477,9 +381,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             }),
-            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://example.com:4500".to_string(),
@@ -508,9 +410,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             }),
-            discord: None,
             codex: None,
             projects: vec![],
         })
@@ -533,9 +433,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
-                enabled: true,
             }),
-            discord: None,
             codex: None,
             projects: vec![],
         })

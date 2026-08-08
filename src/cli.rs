@@ -120,11 +120,6 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: TelegramCommands,
     },
-    #[command(about = "Configure Discord delivery, shared live backend, and reply routing")]
-    Discord {
-        #[command(subcommand)]
-        command: DiscordCommands,
-    },
     #[command(about = "Manage the curated project registry for Telegram-created threads")]
     Projects {
         #[command(subcommand)]
@@ -359,64 +354,12 @@ pub(crate) enum TelegramCommands {
     },
     #[command(about = "Show direct Telegram transport configuration")]
     Status,
-    #[command(about = "Enable direct Telegram delivery and bot polling without changing setup")]
-    Enable {
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-    },
     #[command(about = "Send a test Telegram notification using the bridge config")]
     Test {
         #[arg(long, default_value = "Codex Telegram bridge test")]
         message: String,
         #[arg(long, default_value_t = 10000)]
         timeout_ms: u64,
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-    },
-    #[command(about = "Disable direct Telegram delivery and bot polling without deleting setup")]
-    Disable {
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum DiscordCommands {
-    #[command(about = "Configure the bridge-owned Discord bot transport and shared live backend")]
-    Setup {
-        #[arg(long)]
-        bot_token: Option<String>,
-        #[arg(long = "channel-id", required = true)]
-        channel_ids: Vec<String>,
-        #[arg(long)]
-        allowed_user_id: Option<String>,
-        #[arg(long, default_value = crate::DEFAULT_NOTIFICATION_EVENTS)]
-        events: String,
-        #[arg(long, default_value = "codex-telegram-bridge")]
-        bridge_command: String,
-        #[arg(long, default_value = crate::DEFAULT_CODEX_WEBSOCKET_URL)]
-        websocket_url: String,
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-    },
-    #[command(about = "Show Discord transport configuration")]
-    Status,
-    #[command(about = "Enable Discord delivery and bot polling without changing setup")]
-    Enable {
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-    },
-    #[command(about = "Send a test Discord notification using the bridge config")]
-    Test {
-        #[arg(long, default_value = "Codex Discord bridge test")]
-        message: String,
-        #[arg(long, default_value_t = 10000)]
-        timeout_ms: u64,
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-    },
-    #[command(about = "Disable Discord delivery and bot polling without deleting setup")]
-    Disable {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
@@ -610,7 +553,6 @@ mod tests {
 
         for args in [
             vec!["codex-telegram-bridge", "telegram", "status"],
-            vec!["codex-telegram-bridge", "telegram", "enable", "--dry-run"],
             vec![
                 "codex-telegram-bridge",
                 "telegram",
@@ -619,7 +561,6 @@ mod tests {
                 "hello",
                 "--dry-run",
             ],
-            vec!["codex-telegram-bridge", "telegram", "disable", "--dry-run"],
         ] {
             let parsed = Cli::try_parse_from(args.clone());
             assert!(
@@ -630,67 +571,11 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_discord_setup_and_status_commands() {
-        let parsed = Cli::try_parse_from([
-            "codex-telegram-bridge",
-            "discord",
-            "setup",
-            "--bot-token",
-            "secret",
-            "--channel-id",
-            "123",
-            "--allowed-user-id",
-            "456",
-            "--websocket-url",
-            "ws://127.0.0.1:4500",
-            "--dry-run",
-        ])
-        .expect("discord setup should parse");
-        match parsed.command {
-            Commands::Discord {
-                command:
-                    DiscordCommands::Setup {
-                        channel_ids,
-                        websocket_url,
-                        dry_run,
-                        ..
-                    },
-            } => {
-                assert_eq!(channel_ids, vec!["123"]);
-                assert_eq!(websocket_url, "ws://127.0.0.1:4500");
-                assert!(dry_run);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-
-        for args in [
-            vec!["codex-telegram-bridge", "discord", "status"],
-            vec!["codex-telegram-bridge", "discord", "enable", "--dry-run"],
-            vec![
-                "codex-telegram-bridge",
-                "discord",
-                "test",
-                "--message",
-                "hello",
-                "--dry-run",
-            ],
-            vec!["codex-telegram-bridge", "discord", "disable", "--dry-run"],
-        ] {
-            let parsed = Cli::try_parse_from(args.clone());
-            assert!(
-                parsed.is_ok(),
-                "discord command should parse: {args:?}: {parsed:?}"
-            );
-        }
-    }
-
-    #[test]
     fn cli_accepts_status_surface_commands() {
         for args in [
             vec!["codex-telegram-bridge", "doctor"],
             vec!["codex-telegram-bridge", "daemon", "status"],
             vec!["codex-telegram-bridge", "telegram", "status"],
-            vec!["codex-telegram-bridge", "discord", "status"],
         ] {
             let parsed = Cli::try_parse_from(args.clone());
             assert!(
