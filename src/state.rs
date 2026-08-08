@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::projects::{canonicalize_project_cwd, derive_project_label};
 
@@ -422,8 +423,30 @@ fn optional_from_sql_i64(value: Option<i64>) -> Result<Option<u64>> {
 
 pub(crate) fn create_state_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("failed to set SQLite busy timeout")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;",
+    )
+    .context("failed to configure SQLite journal mode")?;
     init_state_db(&conn)?;
     Ok(conn)
+}
+
+pub(crate) fn prune_state_logs(conn: &Connection, now: u64) -> Result<usize> {
+    let retention_ms: u64 = 30 * 24 * 60 * 60 * 1000;
+    let cutoff = now.saturating_sub(retention_ms);
+    let sql_cutoff = to_sql_i64(cutoff)?;
+    let inbound = conn.execute(
+        "DELETE FROM telegram_inbound_log WHERE processed_at < ?1",
+        params![sql_cutoff],
+    )?;
+    let actions = conn.execute(
+        "DELETE FROM actions_log WHERE created_at < ?1",
+        params![sql_cutoff],
+    )?;
+    Ok(inbound + actions)
 }
 
 #[cfg(test)]
@@ -1577,6 +1600,18 @@ pub(crate) fn update_telegram_callback_message_id(
     Ok(())
 }
 
+pub(crate) fn mark_telegram_callback_route_used(
+    conn: &Connection,
+    callback_id: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE telegram_callback_routes SET used_at = ?2 WHERE callback_id = ?1 AND used_at IS NULL",
+        params![callback_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn lookup_telegram_message_route(
     conn: &Connection,
     chat_id: &str,
@@ -1712,6 +1747,7 @@ pub(crate) fn deliver_due_outbound_events<F>(
     conn: &Connection,
     now: u64,
     limit: usize,
+    deadline: Option<Instant>,
     mut sender: F,
 ) -> Result<OutboxDeliverySummary>
 where
@@ -1741,6 +1777,9 @@ where
         failed: 0,
     };
     for (event_id, payload_json, attempts) in rows {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         summary.attempted += 1;
         let event: Value = serde_json::from_str(&payload_json)
             .with_context(|| format!("outbound event {event_id} contains invalid JSON"))?;
@@ -2249,5 +2288,84 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
 
         assert!(path.ends_with(".codex-telegram-bridge/live-backend.json"));
+    }
+
+    #[test]
+    fn prune_state_logs_removes_only_rows_older_than_retention() {
+        let conn = create_state_db_in_memory().expect("db");
+        let retention_ms: u64 = 30 * 24 * 60 * 60 * 1000;
+        let now = retention_ms + 2000;
+        record_telegram_inbound_processed(
+            &conn,
+            "bot",
+            1,
+            "message_ignored",
+            &json!({}),
+            TelegramInboundLogContext::default(),
+            1000,
+        )
+        .expect("old inbound");
+        record_telegram_inbound_processed(
+            &conn,
+            "bot",
+            2,
+            "message_ignored",
+            &json!({}),
+            TelegramInboundLogContext::default(),
+            now,
+        )
+        .expect("recent inbound");
+        conn.execute(
+            "INSERT INTO actions_log(thread_id, action_type, payload_json, created_at)
+             VALUES ('thr_1', 'x', '{}', 1000)",
+            [],
+        )
+        .expect("old action");
+        conn.execute(
+            "INSERT INTO actions_log(thread_id, action_type, payload_json, created_at)
+             VALUES ('thr_1', 'x', '{}', ?1)",
+            params![to_sql_i64(now).expect("recent timestamp")],
+        )
+        .expect("recent action");
+
+        let removed = prune_state_logs(&conn, now).expect("prune");
+        assert_eq!(removed, 2);
+        assert!(!telegram_inbound_processed(&conn, "bot", 1).expect("old inbound removed"));
+        assert!(telegram_inbound_processed(&conn, "bot", 2).expect("recent inbound kept"));
+        let recent_actions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM actions_log WHERE created_at >= ?1",
+                params![to_sql_i64(now).expect("cutoff")],
+                |row| row.get(0),
+            )
+            .expect("recent actions count");
+        assert_eq!(recent_actions, 1);
+    }
+
+    #[test]
+    fn outbound_delivery_deadline_skips_pending_events() {
+        let conn = create_state_db_in_memory().expect("db");
+        enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "thread_waiting",
+                "threadId": "thr_1",
+                "updatedAt": 42
+            }),
+            1000,
+        )
+        .expect("enqueue");
+
+        let summary = deliver_due_outbound_events(
+            &conn,
+            2000,
+            10,
+            Some(Instant::now() - Duration::from_secs(1)),
+            |_| Ok(json!({ "ok": true })),
+        )
+        .expect("deadline summary");
+
+        assert_eq!(summary.attempted, 0);
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
     }
 }

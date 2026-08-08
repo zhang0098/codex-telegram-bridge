@@ -27,7 +27,7 @@ impl WsJsonRpcTransport {
 
     pub(crate) fn write_json(&mut self, value: &Value) -> Result<()> {
         self.socket
-            .send(Message::Text(serde_json::to_string(value)?))
+            .send(Message::text(serde_json::to_string(value)?))
             .context("failed to write websocket JSON-RPC message")?;
         Ok(())
     }
@@ -120,11 +120,10 @@ impl WsJsonRpcTransport {
 }
 
 fn local_app_server_config() -> WebSocketConfig {
-    WebSocketConfig {
-        max_message_size: Some(LOCAL_APP_SERVER_WEBSOCKET_LIMIT_BYTES),
-        max_frame_size: Some(LOCAL_APP_SERVER_WEBSOCKET_LIMIT_BYTES),
-        ..WebSocketConfig::default()
-    }
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(LOCAL_APP_SERVER_WEBSOCKET_LIMIT_BYTES);
+    config.max_frame_size = Some(LOCAL_APP_SERVER_WEBSOCKET_LIMIT_BYTES);
+    config
 }
 
 pub(crate) fn validate_shared_websocket_url(url: &str) -> Result<Url> {
@@ -238,7 +237,7 @@ mod tests {
                 .send(serde_json::from_str::<Value>(&text).expect("parse websocket request"))
                 .expect("send parsed request");
             socket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::to_string(&json!({
                         "jsonrpc": "2.0",
                         "id": 1,
@@ -293,7 +292,7 @@ mod tests {
             let text = request.into_text().expect("text websocket request");
             serde_json::from_str::<Value>(&text).expect("parse websocket request");
             socket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::to_string(&json!({
                         "jsonrpc": "2.0",
                         "id": 1,

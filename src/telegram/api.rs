@@ -10,13 +10,16 @@ pub(crate) fn telegram_api_post(
     payload: &Value,
     timeout: Duration,
 ) -> Result<Value> {
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .build()
+        .new_agent();
     let url = format!(
         "https://api.telegram.org/bot{}/{}",
         bot_token.trim(),
         method.trim()
     );
-    let response = agent
+    let mut response = agent
         .post(&url)
         .send_json(payload.clone())
         .map_err(|error| {
@@ -26,7 +29,8 @@ pub(crate) fn telegram_api_post(
             )
         })?;
     let value: Value = response
-        .into_json()
+        .body_mut()
+        .read_json()
         .with_context(|| format!("Telegram API {method} returned invalid JSON"))?;
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
         bail!("Telegram API {method} returned error: {value}");

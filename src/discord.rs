@@ -72,25 +72,34 @@ fn discord_api_request(
     payload: Option<&Value>,
     timeout: Duration,
 ) -> Result<Value> {
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .build()
+        .new_agent();
     let url = format!("{DISCORD_API_BASE}{path}");
-    let request = match method {
-        "GET" => agent.get(&url),
-        "POST" => agent.post(&url),
-        other => bail!("unsupported Discord API method {other}"),
-    }
-    .set(
-        "Authorization",
-        &format!("Bot {}", discord.bot_token.trim()),
-    )
-    .set(
-        "User-Agent",
-        "codex-telegram-bridge (https://github.com/hanifcarroll/codex-telegram-bridge, 0.1)",
-    );
-
     let response = match payload {
-        Some(payload) => request.send_json(payload.clone()),
-        None => request.call(),
+        Some(payload) => match method {
+            "POST" => agent
+                .post(&url)
+                .header("Authorization", &format!("Bot {}", discord.bot_token.trim()))
+                .header(
+                    "User-Agent",
+                    "codex-telegram-bridge (https://github.com/hanifcarroll/codex-telegram-bridge, 0.1)",
+                )
+                .send_json(payload.clone()),
+            other => bail!("unsupported Discord API method {other} with payload"),
+        },
+        None => match method {
+            "GET" => agent
+                .get(&url)
+                .header("Authorization", &format!("Bot {}", discord.bot_token.trim()))
+                .header(
+                    "User-Agent",
+                    "codex-telegram-bridge (https://github.com/hanifcarroll/codex-telegram-bridge, 0.1)",
+                )
+                .call(),
+            other => bail!("unsupported Discord API method {other} without payload"),
+        },
     }
     .map_err(|error| {
         anyhow!(
@@ -99,11 +108,13 @@ fn discord_api_request(
         )
     })?;
 
+    let mut response = response;
     let status = response.status();
     let text = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .with_context(|| format!("Discord API {method} {path} returned invalid text"))?;
-    if !(200..300).contains(&status) {
+    if !status.is_success() {
         bail!("Discord API {method} {path} returned HTTP {status}: {text}");
     }
     if text.trim().is_empty() {
@@ -1056,7 +1067,19 @@ fn process_discord_channel_updates(
     let after = get_setting_number(conn, &key)?;
     let mut messages = list_discord_messages_after(discord, after, timeout)?;
     messages.sort_by_key(|message| discord_message_id(message).unwrap_or_default());
+    process_discord_channel_messages(conn, config, discord, &key, after, &messages, now, timeout)
+}
 
+fn process_discord_channel_messages(
+    conn: &Connection,
+    config: &DaemonConfig,
+    discord: &DiscordConfig,
+    cursor_key: &str,
+    after: Option<u64>,
+    messages: &[Value],
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
     if after.is_none() {
         let latest = messages
             .iter()
@@ -1064,7 +1087,7 @@ fn process_discord_channel_updates(
             .map(|message_id| message_id as u64)
             .max();
         if let Some(message_id) = latest {
-            set_setting(conn, &key, message_id)?;
+            set_setting(conn, cursor_key, message_id)?;
         }
         return Ok(json!({
             "ok": true,
@@ -1084,8 +1107,9 @@ fn process_discord_channel_updates(
     let mut command_prompt_replies = 0usize;
     let mut commands = 0usize;
     let mut ignored = 0usize;
+    let mut failed = 0usize;
     let mut max_message_id = after;
-    for message in &messages {
+    for message in messages {
         let message_id = discord_message_id(message);
         if let Some(message_id) = message_id {
             max_message_id = Some(max_message_id.unwrap_or(0).max(message_id as u64));
@@ -1095,23 +1119,38 @@ fn process_discord_channel_updates(
             ignored += 1;
             continue;
         }
-        if let Some(route) = extract_discord_reply_route(conn, message, discord)? {
-            send_codex_reply_to_thread(conn, config, &route.thread_id, &route.message, now)?;
-            register_discord_typing_indicator(conn, discord, &route.thread_id, now)?;
-            let _ = refresh_discord_typing_indicators(conn, discord, now, timeout);
-            replies += 1;
-        } else if let Some(route) = extract_discord_command_prompt_reply(conn, message, discord)? {
-            execute_discord_command_prompt_reply(conn, discord, message, route, now, timeout)?;
-            command_prompt_replies += 1;
-        } else if let Some(command) = extract_discord_command(message, discord) {
-            execute_discord_command(conn, discord, message, command, now, timeout)?;
-            commands += 1;
-        } else {
-            ignored += 1;
+        let outcome: Result<()> = (|| {
+            if let Some(route) = extract_discord_reply_route(conn, message, discord)? {
+                send_codex_reply_to_thread(conn, config, &route.thread_id, &route.message, now)?;
+                register_discord_typing_indicator(conn, discord, &route.thread_id, now)?;
+                let _ = refresh_discord_typing_indicators(conn, discord, now, timeout);
+                replies += 1;
+            } else if let Some(route) =
+                extract_discord_command_prompt_reply(conn, message, discord)?
+            {
+                execute_discord_command_prompt_reply(conn, discord, message, route, now, timeout)?;
+                command_prompt_replies += 1;
+            } else if let Some(command) = extract_discord_command(message, discord) {
+                execute_discord_command(conn, discord, message, command, now, timeout)?;
+                commands += 1;
+            } else {
+                ignored += 1;
+            }
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            failed += 1;
+            // Keep the cursor moving past the failing message so the channel does not
+            // wedge on it forever (mirrors the Telegram update batch behavior).
+            let _ = discord_send_message(
+                discord,
+                &format!("Your message could not be processed: {error:#}"),
+                timeout,
+            );
         }
     }
     if let Some(message_id) = max_message_id {
-        set_setting(conn, &key, message_id)?;
+        set_setting(conn, cursor_key, message_id)?;
     }
     Ok(json!({
         "ok": true,
@@ -1121,7 +1160,8 @@ fn process_discord_channel_updates(
         "replies": replies,
         "commandPromptReplies": command_prompt_replies,
         "commands": commands,
-        "ignored": ignored
+        "ignored": ignored,
+        "failed": failed
     }))
 }
 
@@ -1406,5 +1446,79 @@ mod tests {
                 .contains("discord-secret"),
             "setup output must not leak Discord bot token"
         );
+    }
+
+    #[test]
+    fn failing_discord_message_is_skipped_and_does_not_wedge_the_channel() {
+        let _guard = crate::state::test_env_lock().lock().expect("test env lock");
+        let root = std::env::temp_dir().join(format!("codex-discord-wedge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create state dir");
+        let previous_state_dir = std::env::var("CODEX_TELEGRAM_BRIDGE_STATE_DIR").ok();
+        std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", &root);
+
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let discord = DiscordConfig {
+            bot_token: "fake-token".to_string(),
+            channel_id: "111".to_string(),
+            channel_ids: Vec::new(),
+            allowed_user_id: Some("789".to_string()),
+            enabled: true,
+        };
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            discord: Some(discord.clone()),
+            codex: Some(crate::CodexConfig {
+                live_mode: crate::CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:9".to_string(),
+            }),
+            projects: Vec::new(),
+        };
+        let messages = vec![
+            json!({
+                "id": "101",
+                "author": { "id": "789", "bot": false },
+                "content": "/threads 10"
+            }),
+            json!({
+                "id": "102",
+                "author": { "id": "789", "bot": false },
+                "content": "plain message"
+            }),
+        ];
+        let cursor_key = format!("discord_last_message_id:{}", discord.channel_id);
+
+        let result = process_discord_channel_messages(
+            &conn,
+            &config,
+            &discord,
+            &cursor_key,
+            Some(100),
+            &messages,
+            0,
+            Duration::from_secs(1),
+        )
+        .expect("discord message batch");
+
+        // /threads fails (daemon config is missing) but the cursor still advances past
+        // the failing message and later messages are still processed: no wedge.
+        assert_eq!(result["failed"], 1);
+        assert_eq!(result["ignored"], 1);
+        assert_eq!(
+            get_setting_number(&conn, &cursor_key)
+                .expect("cursor lookup")
+                .expect("cursor set"),
+            102
+        );
+
+        if let Some(previous_state_dir) = &previous_state_dir {
+            std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", previous_state_dir);
+        } else {
+            std::env::remove_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::codex::{
     normalized_message, set_away_mode, start_thread_in_cwd, sync_state_from_live, text_input_value,
@@ -17,8 +17,9 @@ use crate::state::{
     delete_setting, get_setting_number, get_telegram_current_project_id,
     insert_telegram_callback_route, insert_telegram_command_route, insert_telegram_message_route,
     list_recent_thread_snapshots_from_db, lookup_telegram_command_route,
-    lookup_telegram_message_route, mark_telegram_command_route_used, observed_workspaces_from_db,
-    record_action, record_telegram_inbound_processed, set_setting, set_setting_text,
+    lookup_telegram_message_route, mark_telegram_callback_route_used,
+    mark_telegram_command_route_used, observed_workspaces_from_db, record_action,
+    record_telegram_inbound_processed, set_setting, set_setting_text,
     set_telegram_current_project_id, telegram_inbound_processed,
     update_telegram_callback_message_id, BridgeThreadSnapshot, TelegramCallbackAction,
     TelegramCommandRouteKind, TelegramInboundLogContext,
@@ -84,6 +85,7 @@ pub(crate) struct RoutedTelegramReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutedTelegramCallback {
     pub(crate) callback_query_id: String,
+    pub(crate) callback_id: String,
     pub(crate) thread_id: String,
     pub(crate) action: TelegramCallbackAction,
 }
@@ -515,7 +517,8 @@ pub(crate) fn extract_telegram_callback_route(
     };
     let route = conn
         .query_row(
-            "SELECT thread_id, action FROM telegram_callback_routes WHERE callback_id = ?1",
+            "SELECT thread_id, action FROM telegram_callback_routes
+             WHERE callback_id = ?1 AND used_at IS NULL",
             params![callback_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
@@ -523,6 +526,7 @@ pub(crate) fn extract_telegram_callback_route(
     Ok(route.and_then(|(thread_id, action)| {
         TelegramCallbackAction::from_str(&action).map(|action| RoutedTelegramCallback {
             callback_query_id: callback_query_id.to_string(),
+            callback_id: callback_id.to_string(),
             thread_id,
             action,
         })
@@ -724,8 +728,12 @@ fn send_codex_reply_to_thread(
     thread_id: &str,
     message: &str,
     now: u64,
+    deadline: Option<Instant>,
 ) -> Result<Value> {
     let mut client = CodexAppServerClient::connect_configured(config)?;
+    if let Some(deadline) = deadline {
+        client.set_deadline(deadline);
+    }
     let transport = client.transport_info();
     let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
     let started = client.request(
@@ -781,12 +789,16 @@ fn send_codex_approval_to_thread(
     thread_id: &str,
     action: TelegramCallbackAction,
     now: u64,
+    deadline: Option<Instant>,
 ) -> Result<Value> {
     let sent_text = match action {
         TelegramCallbackAction::Approve => "YES",
         TelegramCallbackAction::Deny => "NO",
     };
     let mut client = CodexAppServerClient::connect_configured(config)?;
+    if let Some(deadline) = deadline {
+        client.set_deadline(deadline);
+    }
     let transport = client.transport_info();
     let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
     let started = client.request(
@@ -865,8 +877,12 @@ fn start_new_thread_from_telegram(
     project: &RegisteredProject,
     message: &str,
     now: u64,
+    deadline: Option<Instant>,
 ) -> Result<Value> {
     let mut client = CodexAppServerClient::connect_configured(config)?;
+    if let Some(deadline) = deadline {
+        client.set_deadline(deadline);
+    }
     let transport = client.transport_info();
     let mut result = start_thread_in_cwd(&mut client, Some(&project.cwd), Some(message))?;
     if let Some(object) = result.as_object_mut() {
@@ -1074,6 +1090,7 @@ fn execute_threads_command(
     raw_limit: Option<String>,
     now: u64,
     timeout: Duration,
+    deadline: Option<Instant>,
 ) -> Result<Value> {
     let limit = match parse_telegram_threads_limit(raw_limit.as_deref()) {
         Ok(limit) => limit,
@@ -1091,6 +1108,9 @@ fn execute_threads_command(
 
     let config = load_daemon_config()?;
     let mut client = CodexAppServerClient::connect_configured(&config)?;
+    if let Some(deadline) = deadline {
+        client.set_deadline(deadline);
+    }
     sync_state_from_live(&mut client, conn, now, limit, false)?;
     let snapshots = list_recent_thread_snapshots_from_db(conn, limit)?;
     if snapshots.is_empty() {
@@ -1109,6 +1129,9 @@ fn execute_threads_command(
 
     let mut sent = Vec::with_capacity(snapshots.len());
     for snapshot in &snapshots {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         sent.push(send_recent_thread_snapshot(
             conn, telegram, snapshot, now, timeout,
         )?);
@@ -1130,6 +1153,7 @@ fn execute_telegram_command(
     command: TelegramInboundCommand,
     now: u64,
     timeout: Duration,
+    deadline: Option<Instant>,
 ) -> Result<Value> {
     let chat_id = telegram_chat_id(message).context("Telegram command missing chat.id")?;
     let user_id = telegram_from_user_id(message);
@@ -1183,18 +1207,19 @@ fn execute_telegram_command(
                 json!({ "ok": true, "action": "discord_disable_command", "state": state, "sent": sent }),
             )
         }
-        TelegramInboundCommand::Threads(raw_limit) => {
-            execute_threads_command(conn, telegram, raw_limit, now, timeout).or_else(|error| {
-                let message = telegram_threads_failure_text(&error);
-                let sent = telegram_send_text(telegram, &message, timeout)?;
-                Ok(json!({
-                    "ok": false,
-                    "action": "telegram_threads_failed",
-                    "error": format!("{error:#}"),
-                    "sent": sent
-                }))
-            })
-        }
+        TelegramInboundCommand::Threads(raw_limit) => execute_threads_command(
+            conn, telegram, raw_limit, now, timeout, deadline,
+        )
+        .or_else(|error| {
+            let message = telegram_threads_failure_text(&error);
+            let sent = telegram_send_text(telegram, &message, timeout)?;
+            Ok(json!({
+                "ok": false,
+                "action": "telegram_threads_failed",
+                "error": format!("{error:#}"),
+                "sent": sent
+            }))
+        }),
         TelegramInboundCommand::Away => {
             execute_away_command(conn, telegram, now, timeout).or_else(|error| {
                 telegram_live_failure_result(
@@ -1229,6 +1254,7 @@ fn execute_telegram_command(
                             request.project,
                             prompt,
                             now,
+                            deadline,
                         )?;
                         let confirmation = send_new_thread_confirmation(
                             conn,
@@ -1383,6 +1409,7 @@ fn execute_telegram_command_prompt_reply(
     route: RoutedTelegramCommandPromptReply,
     now: u64,
     timeout: Duration,
+    deadline: Option<Instant>,
 ) -> Result<Value> {
     let chat_id =
         telegram_chat_id(message).context("Telegram command prompt reply missing chat.id")?;
@@ -1440,8 +1467,14 @@ fn execute_telegram_command_prompt_reply(
                     "sent": sent
                 }));
             };
-            let result =
-                start_new_thread_from_telegram(conn, &config, project, &route.message, now)?;
+            let result = start_new_thread_from_telegram(
+                conn,
+                &config,
+                project,
+                &route.message,
+                now,
+                deadline,
+            )?;
             mark_telegram_command_route_used(conn, &chat_id, reply_message_id, now)?;
             let confirmation =
                 send_new_thread_confirmation(conn, telegram, project, &result, timeout, now)?;
@@ -1461,7 +1494,16 @@ pub(crate) fn process_telegram_updates(
     config: &DaemonConfig,
     now: u64,
     timeout: Duration,
+    deadline: Option<Instant>,
 ) -> Result<Value> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Ok(json!({
+            "ok": true,
+            "transport": "telegram",
+            "seen": 0,
+            "skipped": "cycle_deadline"
+        }));
+    }
     let telegram = config
         .telegram
         .as_ref()
@@ -1471,6 +1513,28 @@ pub(crate) fn process_telegram_updates(
     let offset = get_setting_number(conn, &key)?.map(|value| value as i64 + 1);
     let updates = telegram_get_updates(&telegram.bot_token, offset, 0, timeout)?;
     let updates = telegram_updates_array(&updates)?;
+    process_telegram_update_batch(
+        conn, config, telegram, &bot_id, &key, updates, now, timeout, deadline,
+    )
+}
+
+fn advance_telegram_ack_offset(max_acked: &mut Option<i64>, update_id: Option<i64>) {
+    if let Some(update_id) = update_id {
+        *max_acked = Some(max_acked.map_or(update_id, |current: i64| current.max(update_id)));
+    }
+}
+
+fn process_telegram_update_batch(
+    conn: &Connection,
+    config: &DaemonConfig,
+    telegram: &TelegramConfig,
+    bot_id: &str,
+    offset_key: &str,
+    updates: &[Value],
+    now: u64,
+    timeout: Duration,
+    deadline: Option<Instant>,
+) -> Result<Value> {
     let mut seen = 0usize;
     let mut replies = 0usize;
     let mut command_prompt_replies = 0usize;
@@ -1478,137 +1542,44 @@ pub(crate) fn process_telegram_updates(
     let mut callbacks = 0usize;
     let mut duplicate = 0usize;
     let mut ignored = 0usize;
-    let mut max_update_id = None;
+    let mut failed = 0usize;
+    // The Telegram offset only advances past updates that were durably acked in
+    // telegram_inbound_log. Unprocessed tail updates are left to the next cycle,
+    // so a slow message or an expired batch budget can never skip later messages.
+    let mut max_acked_update_id = None;
     for update in updates {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         seen += 1;
         let update_id = update.get("update_id").and_then(Value::as_i64);
         if let Some(update_id) = update_id {
-            max_update_id =
-                Some(max_update_id.map_or(update_id, |current: i64| current.max(update_id)));
             if telegram_inbound_processed(conn, &bot_id, update_id)? {
                 duplicate += 1;
+                advance_telegram_ack_offset(&mut max_acked_update_id, Some(update_id));
                 continue;
             }
         }
-        if let Some(message) = update.get("message") {
-            let route_message_id = message
-                .get("reply_to_message")
-                .and_then(telegram_message_id);
-            if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
-                let result = send_codex_reply_to_thread(
-                    conn,
-                    config,
-                    &route.thread_id,
-                    &route.message,
-                    now,
-                )?;
-                if let Some(update_id) = update_id {
-                    record_telegram_inbound_processed(
-                        conn,
-                        &bot_id,
-                        update_id,
-                        "telegram_reply",
-                        &result,
-                        codex_log_context_from_result(
-                            &result,
-                            Some(&route.thread_id),
-                            route_message_id,
-                        ),
-                        now,
-                    )?;
-                }
-                replies += 1;
-            } else if let Some(route) =
-                extract_telegram_command_prompt_reply(conn, message, telegram)?
-            {
-                let result = execute_telegram_command_prompt_reply(
-                    conn, telegram, message, route, now, timeout,
-                )?;
-                if let Some(update_id) = update_id {
-                    record_telegram_inbound_processed(
-                        conn,
-                        &bot_id,
-                        update_id,
-                        "telegram_command_prompt_reply",
-                        &result,
-                        TelegramInboundLogContext {
-                            thread_id: result.pointer("/result/threadId").and_then(Value::as_str),
-                            route_message_id,
-                            result_action: result.get("action").and_then(Value::as_str),
-                            codex_transport: result
-                                .pointer("/result/codex/transport")
-                                .and_then(Value::as_str),
-                            codex_app_server_pid: result
-                                .pointer("/result/codex/appServerPid")
-                                .and_then(Value::as_u64)
-                                .and_then(|value| {
-                                    if value <= u32::MAX as u64 {
-                                        Some(value as u32)
-                                    } else {
-                                        None
-                                    }
-                                }),
-                        },
-                        now,
-                    )?;
-                }
-                command_prompt_replies += 1;
-            } else if let Some(command) = extract_telegram_command(message, telegram)? {
-                let result =
-                    execute_telegram_command(conn, telegram, message, command, now, timeout)?;
-                if let Some(update_id) = update_id {
-                    record_telegram_inbound_processed(
-                        conn,
-                        &bot_id,
-                        update_id,
-                        "telegram_command",
-                        &result,
-                        TelegramInboundLogContext {
-                            route_message_id,
-                            result_action: result.get("action").and_then(Value::as_str),
-                            ..TelegramInboundLogContext::default()
-                        },
-                        now,
-                    )?;
-                }
-                commands += 1;
-            } else {
-                if let Some(update_id) = update_id {
-                    record_telegram_inbound_processed(
-                        conn,
-                        &bot_id,
-                        update_id,
-                        "message_ignored",
-                        &json!({ "ignored": true }),
-                        TelegramInboundLogContext {
-                            route_message_id,
-                            ..TelegramInboundLogContext::default()
-                        },
-                        now,
-                    )?;
-                }
-                ignored += 1;
-            }
-        } else if let Some(callback_query) = update.get("callback_query") {
-            let route_message_id = callback_query
-                .get("message")
-                .and_then(|message| message.get("message_id"))
-                .and_then(Value::as_i64);
-            match extract_telegram_callback_route(conn, callback_query, telegram)? {
-                Some(route) => {
-                    let result = send_codex_approval_to_thread(
+        let outcome: Result<()> = (|| {
+            if let Some(message) = update.get("message") {
+                let route_message_id = message
+                    .get("reply_to_message")
+                    .and_then(telegram_message_id);
+                if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
+                    let result = send_codex_reply_to_thread(
                         conn,
                         config,
                         &route.thread_id,
-                        route.action,
+                        &route.message,
                         now,
+                        deadline,
                     )?;
                     if let Some(update_id) = update_id {
                         record_telegram_inbound_processed(
                             conn,
                             &bot_id,
                             update_id,
-                            "callback_query",
+                            "telegram_reply",
                             &result,
                             codex_log_context_from_result(
                                 &result,
@@ -1618,21 +1589,71 @@ pub(crate) fn process_telegram_updates(
                             now,
                         )?;
                     }
-                    let _ = telegram_answer_callback_query(
-                        telegram,
-                        &route.callback_query_id,
-                        "Sent to Codex",
-                        timeout,
-                    );
-                    callbacks += 1;
-                }
-                None => {
+                    replies += 1;
+                } else if let Some(route) =
+                    extract_telegram_command_prompt_reply(conn, message, telegram)?
+                {
+                    let result = execute_telegram_command_prompt_reply(
+                        conn, telegram, message, route, now, timeout, deadline,
+                    )?;
                     if let Some(update_id) = update_id {
                         record_telegram_inbound_processed(
                             conn,
                             &bot_id,
                             update_id,
-                            "callback_query_ignored",
+                            "telegram_command_prompt_reply",
+                            &result,
+                            TelegramInboundLogContext {
+                                thread_id: result
+                                    .pointer("/result/threadId")
+                                    .and_then(Value::as_str),
+                                route_message_id,
+                                result_action: result.get("action").and_then(Value::as_str),
+                                codex_transport: result
+                                    .pointer("/result/codex/transport")
+                                    .and_then(Value::as_str),
+                                codex_app_server_pid: result
+                                    .pointer("/result/codex/appServerPid")
+                                    .and_then(Value::as_u64)
+                                    .and_then(|value| {
+                                        if value <= u32::MAX as u64 {
+                                            Some(value as u32)
+                                        } else {
+                                            None
+                                        }
+                                    }),
+                            },
+                            now,
+                        )?;
+                    }
+                    command_prompt_replies += 1;
+                } else if let Some(command) = extract_telegram_command(message, telegram)? {
+                    let result = execute_telegram_command(
+                        conn, telegram, message, command, now, timeout, deadline,
+                    )?;
+                    if let Some(update_id) = update_id {
+                        record_telegram_inbound_processed(
+                            conn,
+                            &bot_id,
+                            update_id,
+                            "telegram_command",
+                            &result,
+                            TelegramInboundLogContext {
+                                route_message_id,
+                                result_action: result.get("action").and_then(Value::as_str),
+                                ..TelegramInboundLogContext::default()
+                            },
+                            now,
+                        )?;
+                    }
+                    commands += 1;
+                } else {
+                    if let Some(update_id) = update_id {
+                        record_telegram_inbound_processed(
+                            conn,
+                            &bot_id,
+                            update_id,
+                            "message_ignored",
                             &json!({ "ignored": true }),
                             TelegramInboundLogContext {
                                 route_message_id,
@@ -1643,11 +1664,99 @@ pub(crate) fn process_telegram_updates(
                     }
                     ignored += 1;
                 }
+            } else if let Some(callback_query) = update.get("callback_query") {
+                let route_message_id = callback_query
+                    .get("message")
+                    .and_then(|message| message.get("message_id"))
+                    .and_then(Value::as_i64);
+                match extract_telegram_callback_route(conn, callback_query, telegram)? {
+                    Some(route) => {
+                        let result = send_codex_approval_to_thread(
+                            conn,
+                            config,
+                            &route.thread_id,
+                            route.action,
+                            now,
+                            deadline,
+                        )?;
+                        if let Some(update_id) = update_id {
+                            record_telegram_inbound_processed(
+                                conn,
+                                &bot_id,
+                                update_id,
+                                "callback_query",
+                                &result,
+                                codex_log_context_from_result(
+                                    &result,
+                                    Some(&route.thread_id),
+                                    route_message_id,
+                                ),
+                                now,
+                            )?;
+                        }
+                        // Consume the callback route once the approval was accepted by
+                        // Codex, so retried taps or a failed answerCallbackQuery cannot
+                        // send the same YES/NO twice.
+                        mark_telegram_callback_route_used(conn, &route.callback_id, now)?;
+                        let _ = telegram_answer_callback_query(
+                            telegram,
+                            &route.callback_query_id,
+                            "Sent to Codex",
+                            timeout,
+                        );
+                        callbacks += 1;
+                    }
+                    None => {
+                        if let Some(update_id) = update_id {
+                            record_telegram_inbound_processed(
+                                conn,
+                                &bot_id,
+                                update_id,
+                                "callback_query_ignored",
+                                &json!({ "ignored": true }),
+                                TelegramInboundLogContext {
+                                    route_message_id,
+                                    ..TelegramInboundLogContext::default()
+                                },
+                                now,
+                            )?;
+                        }
+                        ignored += 1;
+                    }
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            failed += 1;
+            // Acknowledge the failing update so Telegram long polling advances past it.
+            // Without this, the daemon re-processes the same update forever and every
+            // message behind it is blocked.
+            if let Some(update_id) = update_id {
+                record_telegram_inbound_processed(
+                    conn,
+                    &bot_id,
+                    update_id,
+                    "update_error",
+                    &json!({ "error": format!("{error:#}") }),
+                    TelegramInboundLogContext::default(),
+                    now,
+                )?;
+                advance_telegram_ack_offset(&mut max_acked_update_id, Some(update_id));
+            }
+            if update.get("message").is_some() {
+                let _ = telegram_send_text(
+                    telegram,
+                    &format!("Your message could not be processed: {error:#}"),
+                    timeout,
+                );
+            }
+        } else {
+            advance_telegram_ack_offset(&mut max_acked_update_id, update_id);
         }
     }
-    if let Some(update_id) = max_update_id {
-        set_setting(conn, &key, update_id as u64)?;
+    if let Some(update_id) = max_acked_update_id {
+        set_setting(conn, offset_key, update_id as u64)?;
     }
     Ok(json!({
         "ok": true,
@@ -1658,7 +1767,8 @@ pub(crate) fn process_telegram_updates(
         "commands": commands,
         "callbacks": callbacks,
         "duplicate": duplicate,
-        "ignored": ignored
+        "ignored": ignored,
+        "failed": failed
     }))
 }
 
@@ -1775,7 +1885,7 @@ mod tests {
                         other => panic!("unexpected fake Codex method {other}"),
                     };
                     socket
-                        .send(tungstenite::Message::Text(
+                        .send(tungstenite::Message::text(
                             serde_json::to_string(&json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
@@ -2023,8 +2133,8 @@ mod tests {
             projects: Vec::new(),
         };
 
-        let result =
-            send_codex_reply_to_thread(&conn, &config, "thr_1", "continue", 1000).expect("reply");
+        let result = send_codex_reply_to_thread(&conn, &config, "thr_1", "continue", 1000, None)
+            .expect("reply");
 
         assert_eq!(
             result.pointer("/codex/transport").and_then(Value::as_str),
@@ -2079,6 +2189,7 @@ mod tests {
             "thr_1",
             TelegramCallbackAction::Approve,
             1000,
+            None,
         )
         .expect("approval");
 
@@ -2151,6 +2262,7 @@ mod tests {
             TelegramInboundCommand::Away,
             0,
             Duration::from_secs(1),
+            None,
         )
         .expect("away result");
         assert_eq!(away["ok"], true);
@@ -2170,6 +2282,7 @@ mod tests {
             TelegramInboundCommand::Repair,
             0,
             Duration::from_secs(1),
+            None,
         )
         .expect("repair result");
         assert_eq!(repair["ok"], true);
@@ -2188,6 +2301,7 @@ mod tests {
             TelegramInboundCommand::Back,
             0,
             Duration::from_secs(1),
+            None,
         )
         .expect("back result");
         assert_eq!(back["ok"], true);
@@ -2222,6 +2336,7 @@ mod tests {
             TelegramInboundCommand::Away,
             0,
             Duration::from_secs(1),
+            None,
         )
         .expect("away failure response");
 
@@ -2231,6 +2346,95 @@ mod tests {
             .as_str()
             .expect("failure text")
             .contains("Try /repair"));
+    }
+
+    #[test]
+    fn failing_telegram_update_is_acked_and_does_not_block_later_updates() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _env = LiveCommandEnv::new("failing-update-batch");
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+                enabled: true,
+            }),
+            discord: None,
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:9".to_string(),
+            }),
+            projects: Vec::new(),
+        };
+        write_daemon_config(&config).expect("write daemon config");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = config.telegram.clone().expect("telegram config");
+        let bot_id = telegram_bot_id(&telegram.bot_token);
+        let key = format!("telegram_offset:{bot_id}");
+        let updates = vec![
+            json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "chat": { "id": "456" },
+                    "from": { "id": "789" },
+                    "text": "/discord_on"
+                }
+            }),
+            json!({
+                "update_id": 2,
+                "message": {
+                    "message_id": 11,
+                    "chat": { "id": "456" },
+                    "from": { "id": "789" },
+                    "text": "plain message"
+                }
+            }),
+        ];
+
+        let first = process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            &bot_id,
+            &key,
+            &updates,
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .expect("first batch");
+
+        // /discord_on fails (Discord is not configured) but is acked as an error,
+        // and the later message is still processed: the channel does not wedge.
+        assert_eq!(first["failed"], 1);
+        assert_eq!(first["commands"], 0);
+        assert_eq!(first["ignored"], 1);
+        assert_eq!(
+            get_setting_number(&conn, &key)
+                .expect("offset lookup")
+                .expect("offset set"),
+            2
+        );
+
+        // Re-polling the same updates reports duplicates instead of re-failing forever.
+        let second = process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            &bot_id,
+            &key,
+            &updates,
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .expect("second batch");
+        assert_eq!(second["duplicate"], 2);
+        assert_eq!(second["failed"], 0);
     }
 
     #[test]
@@ -2259,5 +2463,126 @@ mod tests {
         assert!(parse_telegram_threads_limit(Some("0")).is_err());
         assert!(parse_telegram_threads_limit(Some("26")).is_err());
         assert!(parse_telegram_threads_limit(Some("two")).is_err());
+    }
+
+    #[test]
+    fn telegram_batch_deadline_does_not_advance_offset_past_unacked_updates() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = TelegramConfig {
+            bot_token: "123:secret".to_string(),
+            chat_id: "456".to_string(),
+            allowed_user_id: Some("789".to_string()),
+            enabled: true,
+        };
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(telegram.clone()),
+            discord: None,
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:9".to_string(),
+            }),
+            projects: Vec::new(),
+        };
+        let bot_id = telegram_bot_id(&telegram.bot_token);
+        let key = format!("telegram_offset:{bot_id}");
+        let updates = vec![
+            json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "chat": { "id": "456" },
+                    "from": { "id": "789" },
+                    "text": "plain message"
+                }
+            }),
+            json!({
+                "update_id": 2,
+                "message": {
+                    "message_id": 11,
+                    "chat": { "id": "456" },
+                    "from": { "id": "789" },
+                    "text": "plain message"
+                }
+            }),
+        ];
+
+        let expired = process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            &bot_id,
+            &key,
+            &updates,
+            0,
+            Duration::from_secs(1),
+            Some(Instant::now() - Duration::from_secs(1)),
+        )
+        .expect("expired batch");
+        assert_eq!(expired["seen"], 0);
+        assert_eq!(
+            get_setting_number(&conn, &key).expect("offset lookup"),
+            None
+        );
+
+        let full = process_telegram_update_batch(
+            &conn,
+            &config,
+            &telegram,
+            &bot_id,
+            &key,
+            &updates,
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .expect("full batch");
+        assert_eq!(full["ignored"], 2);
+        assert_eq!(
+            get_setting_number(&conn, &key)
+                .expect("offset lookup")
+                .expect("offset set"),
+            2
+        );
+    }
+
+    #[test]
+    fn telegram_callback_route_is_consumed_after_use() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = TelegramConfig {
+            bot_token: "123:secret".to_string(),
+            chat_id: "456".to_string(),
+            allowed_user_id: Some("789".to_string()),
+            enabled: true,
+        };
+        insert_telegram_callback_route(
+            &conn,
+            &crate::state::TelegramCallbackRoute {
+                callback_id: "cb_1".to_string(),
+                chat_id: "456".to_string(),
+                message_id: None,
+                thread_id: "thr_1".to_string(),
+                action: TelegramCallbackAction::Approve,
+            },
+            1000,
+        )
+        .expect("insert route");
+        let callback_query = json!({
+            "id": "cq_1",
+            "from": { "id": 789 },
+            "message": { "message_id": 10, "chat": { "id": "456" } },
+            "data": "codex:cb_1"
+        });
+
+        let route =
+            extract_telegram_callback_route(&conn, &callback_query, &telegram).expect("route");
+        assert!(route.is_some());
+
+        mark_telegram_callback_route_used(&conn, "cb_1", 2000).expect("mark used");
+        let after =
+            extract_telegram_callback_route(&conn, &callback_query, &telegram).expect("after");
+        assert!(after.is_none());
     }
 }

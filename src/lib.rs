@@ -1730,8 +1730,9 @@ mod tests {
             "same delivery id should not enqueue twice"
         );
 
-        let failed = deliver_due_outbound_events(&conn, 1000, 10, |_| bail!("Hermes offline"))
-            .expect("failed delivery summary");
+        let failed =
+            deliver_due_outbound_events(&conn, 1000, 10, None, |_| bail!("Hermes offline"))
+                .expect("failed delivery summary");
         assert_eq!(
             failed,
             OutboxDeliverySummary {
@@ -1742,12 +1743,14 @@ mod tests {
         );
         assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
 
-        let delayed = deliver_due_outbound_events(&conn, 1000, 10, |_| Ok(json!({"ok": true})))
-            .expect("not due summary");
+        let delayed =
+            deliver_due_outbound_events(&conn, 1000, 10, None, |_| Ok(json!({"ok": true})))
+                .expect("not due summary");
         assert_eq!(delayed.attempted, 0);
 
-        let delivered = deliver_due_outbound_events(&conn, 2000, 10, |_| Ok(json!({"ok": true})))
-            .expect("delivered summary");
+        let delivered =
+            deliver_due_outbound_events(&conn, 2000, 10, None, |_| Ok(json!({"ok": true})))
+                .expect("delivered summary");
         assert_eq!(
             delivered,
             OutboxDeliverySummary {

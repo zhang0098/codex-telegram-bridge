@@ -1233,7 +1233,7 @@ fn spawn_test_live_backend(websocket_url: &str) -> Result<Option<u32>> {
                 Err(_) => continue,
             };
 
-            let _ = socket.send(Message::Text(
+            let _ = socket.send(Message::text(
                 serde_json::to_string(&serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": initialize["id"],

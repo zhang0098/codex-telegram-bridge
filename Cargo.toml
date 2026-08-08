@@ -15,11 +15,11 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 fs2 = "0.4"
 notify = "8"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
-ureq = { version = "2", features = ["json"] }
+sha2 = "0.11"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+ureq = { version = "3", features = ["json"] }
 url = "2"
 which = "8"

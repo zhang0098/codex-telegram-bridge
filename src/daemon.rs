@@ -1,12 +1,14 @@
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::codex::{
     filter_watch_events, parse_event_filter, start_codex_watch_receiver, sync_state_from_live,
@@ -15,7 +17,7 @@ use crate::codex::{
 use crate::discord::{deliver_discord_event, process_discord_updates};
 use crate::state::{
     create_state_db, deliver_due_outbound_events, enqueue_outbound_event, pending_outbound_count,
-    record_transport_delivery, should_emit_for_away_window, state_db_path,
+    prune_state_logs, record_transport_delivery, should_emit_for_away_window, state_db_path,
     transport_delivery_exists, OutboxDeliverySummary,
 };
 use crate::telegram::{
@@ -42,6 +44,52 @@ pub(crate) struct DaemonServiceSpec {
 }
 
 pub(crate) const DEFAULT_DAEMON_LABEL: &str = "com.hanifcarroll.codex-telegram-bridge";
+const DAEMON_PRUNE_INTERVAL_MS: u64 = 10 * 60 * 1000;
+const DAEMON_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct DaemonLock {
+    file: fs::File,
+}
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn daemon_lock_path() -> Result<PathBuf> {
+    Ok(state_db_path()?.with_file_name("daemon.lock"))
+}
+
+fn acquire_daemon_lock() -> Result<DaemonLock> {
+    let path = daemon_lock_path()?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open daemon lock at {}", path.display()))?;
+    let started = Instant::now();
+    loop {
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(DaemonLock { file }),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if started.elapsed() >= DAEMON_LOCK_TIMEOUT {
+                    bail!(
+                        "another daemon instance is already running (lock: {})",
+                        path.display()
+                    );
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to lock daemon instance at {}", path.display())
+                })
+            }
+        }
+    }
+}
 
 fn event_observed_at(event: &Value) -> Option<u64> {
     event
@@ -121,8 +169,9 @@ fn deliver_outbound_events(
     config: &DaemonConfig,
     now: u64,
     timeout: Duration,
+    deadline: Instant,
 ) -> Result<OutboxDeliverySummary> {
-    deliver_due_outbound_events(conn, now, 100, |event| {
+    deliver_due_outbound_events(conn, now, 100, Some(deadline), |event| {
         let event_id = notification_event_id(event);
         let telegram =
             if let Some(telegram) = config.telegram.as_ref().filter(|telegram| telegram.enabled) {
@@ -152,15 +201,56 @@ fn deliver_outbound_events(
     })
 }
 
+fn daemon_cycle_budget(timeout: Duration) -> Duration {
+    timeout.max(Duration::from_secs(5)).saturating_mul(3)
+}
+
 fn daemon_cycle(
     conn: &Connection,
     config: &DaemonConfig,
     now: u64,
     timeout: Duration,
 ) -> Result<Value> {
+    let deadline = Instant::now() + daemon_cycle_budget(timeout);
     let filter = parse_event_filter(Some(&config.events));
     let backend = reconcile_daemon_backend(conn, config, now);
+    let telegram_updates = match config.telegram.as_ref().filter(|telegram| telegram.enabled) {
+        Some(telegram) => {
+            let mut result =
+                match process_telegram_updates(conn, config, now, timeout, Some(deadline)) {
+                    Ok(result) => result,
+                    Err(error) => json!({
+                        "ok": false,
+                        "transport": "telegram",
+                        "error": format!("{error:#}")
+                    }),
+                };
+            let typing = if Instant::now() < deadline {
+                refresh_telegram_typing_indicators(conn, telegram, now, timeout).unwrap_or_else(
+                    |error| {
+                        json!({
+                            "ok": false,
+                            "transport": "telegram",
+                            "error": format!("{error:#}")
+                        })
+                    },
+                )
+            } else {
+                json!({
+                    "ok": true,
+                    "transport": "telegram",
+                    "skipped": "cycle_deadline"
+                })
+            };
+            if let Some(object) = result.as_object_mut() {
+                object.insert("typing".to_string(), typing);
+            }
+            result
+        }
+        None => Value::Null,
+    };
     let events = match CodexAppServerClient::connect_configured(config).and_then(|mut client| {
+        client.set_deadline(deadline);
         let sync_result = sync_state_from_live(&mut client, conn, now, 50, true)?;
         Ok(watch_events_from_sync_result(
             &sync_result,
@@ -173,36 +263,9 @@ fn daemon_cycle(
     };
     let enqueued = enqueue_daemon_notification_events(conn, &events, now)?;
     let delivery = if away_notifications_enabled(conn)? {
-        deliver_outbound_events(conn, config, now, timeout)?
+        deliver_outbound_events(conn, config, now, timeout, deadline)?
     } else {
         OutboxDeliverySummary::default()
-    };
-    let telegram_updates = match config.telegram.as_ref().filter(|telegram| telegram.enabled) {
-        Some(telegram) => {
-            let typing = refresh_telegram_typing_indicators(conn, telegram, now, timeout)
-                .unwrap_or_else(|error| {
-                    json!({
-                        "ok": false,
-                        "transport": "telegram",
-                        "error": format!("{error:#}")
-                    })
-                });
-            match process_telegram_updates(conn, config, now, timeout) {
-                Ok(mut result) => {
-                    if let Some(object) = result.as_object_mut() {
-                        object.insert("typing".to_string(), typing);
-                    }
-                    result
-                }
-                Err(error) => json!({
-                    "ok": false,
-                    "transport": "telegram",
-                    "typing": typing,
-                    "error": format!("{error:#}")
-                }),
-            }
-        }
-        None => Value::Null,
     };
     let discord_updates = match config.discord.as_ref().filter(|discord| discord.enabled) {
         Some(_) => match process_discord_updates(conn, config, now, timeout) {
@@ -229,6 +292,7 @@ fn daemon_cycle(
 }
 
 pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> Result<()> {
+    let _daemon_lock = acquire_daemon_lock()?;
     let db_path = state_db_path()?;
     let conn = create_state_db(&db_path)?;
     let config = load_daemon_config()?;
@@ -264,10 +328,76 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
         }))?
     );
     let watch_rx = start_codex_watch_receiver().ok();
+    let mut last_prune_at = 0u64;
     loop {
-        let config = load_daemon_config()?;
-        let result = daemon_cycle(&conn, &config, now_millis()?, timeout)?;
-        println!("{}", serde_json::to_string(&result)?);
+        let config = match load_daemon_config() {
+            Ok(config) => config,
+            Err(error) => {
+                println!(
+                    "{}",
+                    json!({
+                        "ok": false,
+                        "action": "daemon_config_error",
+                        "error": format!("{error:#}")
+                    })
+                );
+                thread::sleep(Duration::from_millis(poll_interval));
+                continue;
+            }
+        };
+        let now = match now_millis() {
+            Ok(now) => now,
+            Err(error) => {
+                println!(
+                    "{}",
+                    json!({
+                        "ok": false,
+                        "action": "daemon_clock_error",
+                        "error": format!("{error:#}")
+                    })
+                );
+                thread::sleep(Duration::from_millis(poll_interval));
+                continue;
+            }
+        };
+        if now.saturating_sub(last_prune_at) >= DAEMON_PRUNE_INTERVAL_MS {
+            match prune_state_logs(&conn, now) {
+                Ok(removed) => {
+                    println!(
+                        "{}",
+                        json!({
+                            "ok": true,
+                            "action": "daemon_logs_pruned",
+                            "removed": removed
+                        })
+                    );
+                }
+                Err(error) => {
+                    println!(
+                        "{}",
+                        json!({
+                            "ok": false,
+                            "action": "daemon_logs_prune_error",
+                            "error": format!("{error:#}")
+                        })
+                    );
+                }
+            }
+            last_prune_at = now;
+        }
+        match daemon_cycle(&conn, &config, now, timeout) {
+            Ok(result) => println!("{}", result),
+            Err(error) => {
+                println!(
+                    "{}",
+                    json!({
+                        "ok": false,
+                        "action": "daemon_cycle_error",
+                        "error": format!("{error:#}")
+                    })
+                );
+            }
+        }
         if let Some(rx) = watch_rx.as_ref() {
             rx.recv_timeout(Duration::from_millis(poll_interval));
         } else {
@@ -919,8 +1049,14 @@ mod tests {
             projects: Vec::new(),
         };
 
-        let summary = deliver_outbound_events(&conn, &config, 3000, Duration::from_millis(10))
-            .expect("deliver disabled transport");
+        let summary = deliver_outbound_events(
+            &conn,
+            &config,
+            3000,
+            Duration::from_millis(10),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("deliver disabled transport");
 
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.delivered, 1);

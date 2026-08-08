@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 #[cfg(test)]
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{CodexConfig, CodexLiveMode, DaemonConfig};
 use crate::now_millis;
@@ -483,6 +483,14 @@ pub(crate) fn sync_state_from_live(
 ) -> Result<Value> {
     let away = get_setting_text(conn, "away")?.unwrap_or_default() == "true";
     let away_started_at = get_setting_number(conn, "away_started_at")?;
+    if client.deadline_exceeded() {
+        return Ok(json!({
+            "synced": 0,
+            "threads": [],
+            "events": [],
+            "away": away
+        }));
+    }
     let list = client.request(
         "thread/list",
         json!({
@@ -493,6 +501,9 @@ pub(crate) fn sync_state_from_live(
     let mut snapshots = Vec::new();
     if let Some(summaries) = list.get("data").and_then(Value::as_array) {
         for summary in summaries {
+            if client.deadline_exceeded() {
+                break;
+            }
             let thread_id = summary
                 .get("id")
                 .and_then(Value::as_str)
@@ -515,7 +526,11 @@ pub(crate) fn sync_state_from_live(
     }
     let sync_result = reconcile_thread_snapshots(conn, now, snapshots, record_deliveries)?;
     enrich_completed_event_previews(sync_result, |thread_id| {
-        fetch_full_completed_preview(client, thread_id)
+        if client.deadline_exceeded() {
+            Ok(None)
+        } else {
+            fetch_full_completed_preview(client, thread_id)
+        }
     })
 }
 
@@ -1516,6 +1531,8 @@ pub(crate) struct CodexAppServerClient {
     next_id: u64,
     notifications: Vec<Value>,
     pending_transport_error: Option<String>,
+    request_timeout: Duration,
+    deadline: Option<Instant>,
 }
 
 const SHARED_WEBSOCKET_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1599,6 +1616,8 @@ impl CodexAppServerClient {
             next_id: 1,
             notifications: Vec::new(),
             pending_transport_error: None,
+            request_timeout: shared_websocket_request_timeout(),
+            deadline: None,
         };
 
         let _ = client.request_with_timeout(
@@ -1624,6 +1643,15 @@ impl CodexAppServerClient {
         }
     }
 
+    pub(crate) fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    pub(crate) fn deadline_exceeded(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         let envelope = json!({
             "jsonrpc": "2.0",
@@ -1634,7 +1662,7 @@ impl CodexAppServerClient {
     }
 
     pub(crate) fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.request_with_timeout(method, params, shared_websocket_request_timeout())
+        self.request_with_timeout(method, params, self.request_timeout)
     }
 
     fn request_with_timeout(
@@ -1644,6 +1672,16 @@ impl CodexAppServerClient {
         shared_websocket_timeout: Duration,
     ) -> Result<Value> {
         self.take_pending_transport_error()?;
+        let timeout = match self.deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    bail!("Codex request deadline exceeded while waiting for {method}");
+                }
+                remaining.min(shared_websocket_timeout)
+            }
+            None => shared_websocket_timeout,
+        };
 
         let id = self.next_id;
         self.next_id += 1;
@@ -1656,7 +1694,7 @@ impl CodexAppServerClient {
         self.write_message(&envelope)?;
 
         loop {
-            let parsed = self.read_message_blocking(method, shared_websocket_timeout)?;
+            let parsed = self.read_message_blocking(method, timeout)?;
             if let Some(result) = handle_app_server_message(&parsed, id, &mut self.notifications)? {
                 return Ok(result);
             }
@@ -2186,7 +2224,7 @@ raise SystemExit(1)
                     let parsed: Value = serde_json::from_str(&text).expect("parse websocket JSON");
                     requests.push(parsed);
                     socket
-                        .send(tungstenite::Message::Text(
+                        .send(tungstenite::Message::text(
                             serde_json::to_string(&response).expect("serialize websocket response"),
                         ))
                         .expect("send websocket response");
@@ -2316,7 +2354,7 @@ raise SystemExit(1)
             let initialize: Value =
                 serde_json::from_str(&initialize).expect("parse initialize request");
             socket
-                .send(tungstenite::Message::Text(
+                .send(tungstenite::Message::text(
                     serde_json::to_string(&json!({
                         "jsonrpc": "2.0",
                         "id": initialize["id"],
@@ -2339,7 +2377,7 @@ raise SystemExit(1)
             let request = request.into_text().expect("thread/list text");
             let request: Value = serde_json::from_str(&request).expect("parse thread/list request");
             socket
-                .send(tungstenite::Message::Text(
+                .send(tungstenite::Message::text(
                     serde_json::to_string(&json!({
                         "jsonrpc": "2.0",
                         "method": "item/completed",
@@ -2353,7 +2391,7 @@ raise SystemExit(1)
                 ))
                 .expect("send notification");
             socket
-                .send(tungstenite::Message::Text(
+                .send(tungstenite::Message::text(
                     serde_json::to_string(&json!({
                         "jsonrpc": "2.0",
                         "id": request["id"],
@@ -2457,7 +2495,7 @@ raise SystemExit(1)
             let started = Instant::now();
             while started.elapsed() < Duration::from_millis(500) {
                 if socket
-                    .send(tungstenite::Message::Ping(vec![1, 2, 3]))
+                    .send(tungstenite::Message::Ping(vec![1, 2, 3].into()))
                     .is_err()
                 {
                     break;
