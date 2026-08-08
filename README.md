@@ -1,5 +1,7 @@
 # codex-telegram-bridge
 
+This project is a fork of [HanifCarroll/codex-telegram-bridge](https://github.com/HanifCarroll/codex-telegram-bridge).
+
 `codex-telegram-bridge` lets a local assistant inspect and control Codex threads, and lets you keep working through Telegram when you explicitly mark yourself away.
 
 The product rule is simple:
