@@ -235,6 +235,11 @@ pub(crate) enum Commands {
         events: Option<String>,
         positional_decision: Option<String>,
     },
+    #[command(about = "Reset runtime state to initial (keeps config.json)")]
+    Reset {
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     #[command(about = "Run a stdio MCP server for Hermes")]
     Mcp,
     #[command(about = "Install or inspect Hermes integration helpers")]
@@ -821,6 +826,23 @@ mod tests {
         assert!(!help.contains("Fork a Codex thread"));
         assert!(!help.contains("Archive explicit threads"));
         assert!(!help.contains("Unarchive a Codex thread"));
+    }
+
+    #[test]
+    fn cli_accepts_reset_command() {
+        let parsed = Cli::try_parse_from(["codex-telegram-bridge", "reset", "--dry-run"])
+            .expect("reset should parse");
+        match parsed.command {
+            Commands::Reset { dry_run } => assert!(dry_run),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let parsed = Cli::try_parse_from(["codex-telegram-bridge", "reset"])
+            .expect("reset without flags should parse");
+        match parsed.command {
+            Commands::Reset { dry_run } => assert!(!dry_run),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

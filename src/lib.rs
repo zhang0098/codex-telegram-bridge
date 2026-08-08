@@ -3,8 +3,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::fs;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod cli;
 mod codex;
@@ -34,9 +35,9 @@ use crate::codex::{
 #[cfg(test)]
 use crate::codex::{derive_pending_prompt, normalize_thread_snapshot};
 use crate::daemon::{
-    daemon_service_logs, daemon_service_spec, daemon_service_status, install_daemon_service,
-    run_daemon, start_daemon_service, stop_daemon_service, uninstall_daemon_service,
-    DEFAULT_DAEMON_LABEL,
+    daemon_lock_free, daemon_service_logs, daemon_service_spec, daemon_service_status,
+    install_daemon_service, run_daemon, start_daemon_service, stop_daemon_service,
+    uninstall_daemon_service, DEFAULT_DAEMON_LABEL,
 };
 use crate::discord::{
     discord_set_enabled_result, discord_setup_result, discord_status_result, discord_test_result,
@@ -70,7 +71,7 @@ pub(crate) use config::{
 #[allow(unused_imports)]
 pub(crate) use live::{
     ensure_live_backend, live_backend_idle_status, live_backend_status, reconcile_live_backend,
-    reset_live_backend,
+    reset_live_backend, terminate_recorded_live_backend,
 };
 use rusqlite::Connection;
 pub(crate) use state::state_dir_path;
@@ -969,6 +970,10 @@ fn run() -> Result<()> {
             let stdout = std::io::stdout();
             run_mcp_server(stdin.lock(), stdout.lock())?;
         }
+        Commands::Reset { dry_run } => {
+            let result = reset_result(dry_run)?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Commands::Hermes { command } => match command {
             HermesCommands::Install {
                 server_name,
@@ -1262,6 +1267,115 @@ fn remote_mode_off_result() -> Result<Value> {
     let away = set_away_mode(&conn, false, now)?;
     let backend = remote_backend_status_value(config.as_ref(), false);
     remote_mode_status_payload("remote_off", config.as_ref(), away, backend, &conn)
+}
+
+const RESET_RUNTIME_FILES: &[&str] = &[
+    "state.db",
+    "state.db-wal",
+    "state.db-shm",
+    "remote-mode.json",
+    "live-backend.json",
+    "daemon.lock",
+    "live-backend.lock",
+    "daemon.out.log",
+    "daemon.err.log",
+];
+
+fn reset_result(dry_run: bool) -> Result<Value> {
+    let state_dir = state_dir_path()?;
+    let config_path = daemon_config_path()?;
+    let config_preserved = config_path.exists();
+
+    let mut daemon_stopped = false;
+    let mut backend_terminated_pid = None;
+
+    if !dry_run {
+        let status = daemon_service_status(DEFAULT_DAEMON_LABEL)?;
+        let service_exists = status
+            .get("serviceExists")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let service_running = status
+            .pointer("/serviceStatus/running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if service_exists && service_running {
+            let stop = stop_daemon_service(DEFAULT_DAEMON_LABEL, false)?;
+            daemon_stopped = stop
+                .pointer("/output/success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        }
+
+        let started = Instant::now();
+        loop {
+            if daemon_lock_free()? {
+                break;
+            }
+            if started.elapsed() >= Duration::from_secs(5) {
+                bail!(
+                    "daemon is still running; stop it first with `codex-telegram-bridge daemon stop`"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        backend_terminated_pid = terminate_recorded_live_backend()?;
+    }
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for name in RESET_RUNTIME_FILES {
+        let path = state_dir.join(name);
+        if dry_run {
+            if path.exists() {
+                removed.push((*name).to_string());
+            } else {
+                missing.push((*name).to_string());
+            }
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed.push((*name).to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push((*name).to_string())
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to remove runtime state file {}", path.display())
+                })
+            }
+        }
+    }
+
+    let removed_value: Value = removed.into();
+    let missing_value: Value = missing.into();
+    let removed_files = if dry_run {
+        Value::Null
+    } else {
+        removed_value.clone()
+    };
+    let would_remove_files = if dry_run { removed_value } else { Value::Null };
+
+    Ok(json!({
+        "ok": true,
+        "action": "reset",
+        "dryRun": dry_run,
+        "stateFolderPath": state_dir,
+        "configPath": config_path,
+        "configPreserved": config_preserved,
+        "daemonStopped": daemon_stopped,
+        "backendTerminatedPid": backend_terminated_pid,
+        "removedFiles": removed_files,
+        "wouldRemoveFiles": would_remove_files,
+        "missingFiles": missing_value,
+        "keptFiles": json!(["config.json"]),
+        "nextStep": if config_preserved {
+            json!("Config was preserved. Run `codex-telegram-bridge daemon start` to resume background delivery with fresh state.")
+        } else {
+            json!("No config found. Run `codex-telegram-bridge setup` to configure the bridge.")
+        }
+    }))
 }
 
 fn projects_list_result(observed_limit: u64) -> Result<Value> {
@@ -1832,5 +1946,132 @@ mod tests {
                 Some(format!("preview for {thread_id}")),
             ),
         }
+    }
+
+    #[test]
+    fn reset_dry_run_reports_runtime_files_and_preserves_config() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let state = TempStateDir::new("reset-dry-run");
+        write_daemon_config(&DaemonConfig {
+            version: 4,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: "thread_waiting".to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+                enabled: true,
+            }),
+            discord: None,
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:4500".to_string(),
+            }),
+            projects: Vec::new(),
+        })
+        .expect("write config");
+        for name in ["state.db", "state.db-wal", "remote-mode.json", "live-backend.json"] {
+            fs::write(state.root.join(name), "runtime").expect("write runtime file");
+        }
+
+        let result = reset_result(true).expect("reset dry run");
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["action"], "reset");
+        assert_eq!(result["dryRun"], true);
+        assert_eq!(result["configPreserved"], true);
+        let would_remove = result["wouldRemoveFiles"]
+            .as_array()
+            .expect("wouldRemoveFiles array");
+        let names = would_remove
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"state.db"));
+        assert!(names.contains(&"state.db-wal"));
+        assert!(names.contains(&"remote-mode.json"));
+        assert!(names.contains(&"live-backend.json"));
+        assert!(result["removedFiles"].is_null());
+        assert!(
+            state.root.join("state.db").exists(),
+            "dry run must not remove files"
+        );
+        assert!(
+            state.root.join("config.json").exists(),
+            "config must be preserved"
+        );
+    }
+
+    #[test]
+    fn reset_removes_runtime_state_and_preserves_config() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let state = TempStateDir::new("reset-removes");
+        write_daemon_config(&DaemonConfig {
+            version: 4,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: "thread_waiting".to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+                enabled: true,
+            }),
+            discord: None,
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:4500".to_string(),
+            }),
+            projects: Vec::new(),
+        })
+        .expect("write config");
+        for name in [
+            "state.db",
+            "state.db-wal",
+            "state.db-shm",
+            "remote-mode.json",
+            "daemon.lock",
+            "live-backend.lock",
+            "daemon.out.log",
+            "daemon.err.log",
+        ] {
+            fs::write(state.root.join(name), "runtime").expect("write runtime file");
+        }
+        fs::write(
+            state.root.join("live-backend.json"),
+            r#"{"websocketUrl":"ws://127.0.0.1:9","pid":null,"healthy":false,"lastError":null,"required":false,"state":"idle","recoverable":true,"reconcileAttempts":0,"retryAfterMs":null}"#,
+        )
+        .expect("write live backend status");
+
+        let result = reset_result(false).expect("reset");
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["action"], "reset");
+        assert_eq!(result["dryRun"], false);
+        assert_eq!(result["configPreserved"], true);
+        for name in [
+            "state.db",
+            "state.db-wal",
+            "state.db-shm",
+            "remote-mode.json",
+            "live-backend.json",
+            "daemon.lock",
+            "live-backend.lock",
+            "daemon.out.log",
+            "daemon.err.log",
+        ] {
+            assert!(
+                !state.root.join(name).exists(),
+                "{name} should be removed by reset"
+            );
+        }
+        assert!(
+            state.root.join("config.json").exists(),
+            "config must be preserved"
+        );
+        let removed = result["removedFiles"].as_array().expect("removedFiles array");
+        let names = removed.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        assert!(names.contains(&"state.db"));
+        assert!(names.contains(&"remote-mode.json"));
+        assert!(result["wouldRemoveFiles"].is_null());
     }
 }

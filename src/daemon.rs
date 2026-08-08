@@ -91,6 +91,24 @@ fn acquire_daemon_lock() -> Result<DaemonLock> {
     }
 }
 
+pub(crate) fn daemon_lock_free() -> Result<bool> {
+    let path = daemon_lock_path()?;
+    let file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open daemon lock at {}", path.display()))
+        }
+    };
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to probe daemon lock at {}", path.display())),
+    }
+}
+
 fn event_observed_at(event: &Value) -> Option<u64> {
     event
         .get("updatedAt")

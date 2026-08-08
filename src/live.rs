@@ -199,6 +199,31 @@ pub(crate) fn reset_live_backend(config: &CodexConfig) -> Result<EnsureLiveBacke
     start_live_backend(config, "restarted")
 }
 
+pub(crate) fn terminate_recorded_live_backend() -> Result<Option<u32>> {
+    let _lock = acquire_live_backend_lock()?;
+    let mut recorded_pid = None;
+    match read_live_backend_status() {
+        Ok(Some(mut status)) => {
+            backfill_process_start_key(&mut status);
+            recorded_pid = status.pid;
+            if let Some(pid) = status.pid {
+                terminate_managed_backend_pid(
+                    pid,
+                    &status.websocket_url,
+                    status.process_start_key.as_deref(),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!(
+                "reset: ignoring unreadable live backend status: {error:#}"
+            );
+        }
+    }
+    Ok(recorded_pid)
+}
+
 #[allow(dead_code)]
 fn live_backend_status_unlocked(config: &CodexConfig, required: bool) -> Result<LiveBackendStatus> {
     let previous_status = read_live_backend_status()?;
