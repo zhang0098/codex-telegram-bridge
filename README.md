@@ -55,10 +55,10 @@ cargo install --path .
 Install from Git:
 
 ```bash
-cargo install --git https://github.com/hanifcarroll/codex-telegram-bridge
+cargo install --git https://github.com/zhang0098/codex-telegram-bridge
 ```
 
-Download a prebuilt archive from [GitHub Releases](https://github.com/HanifCarroll/codex-telegram-bridge/releases) when a tagged release is available.
+Download a prebuilt archive from [GitHub Releases](https://github.com/zhang0098/codex-telegram-bridge/releases) when a tagged release is available.
 
 Run through the wrapper without installing:
 

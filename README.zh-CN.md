@@ -55,10 +55,10 @@ cargo install --path .
 从 Git 安装：
 
 ```bash
-cargo install --git https://github.com/hanifcarroll/codex-telegram-bridge
+cargo install --git https://github.com/zhang0098/codex-telegram-bridge
 ```
 
-当有标签发布时，可以从 [GitHub Releases](https://github.com/HanifCarroll/codex-telegram-bridge/releases) 下载预构建压缩包。
+当有标签发布时，可以从 [GitHub Releases](https://github.com/zhang0098/codex-telegram-bridge/releases) 下载预构建压缩包。
 
 不安装直接通过包装脚本运行：
 

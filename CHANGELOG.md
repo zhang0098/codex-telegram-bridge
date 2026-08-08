@@ -6,6 +6,15 @@ All notable changes to `codex-telegram-bridge` will be documented here.
 
 No unreleased changes yet.
 
+## 0.1.1 - 2026-08-08
+
+- Remove the Discord transport entirely: the `discord` CLI surface, DiscordConfig, daemon polling/delivery paths, and `docs/discord.md` are gone.
+- Remove the `/discord_on`, `/discord_off`, `/telegram_on`, and `/telegram_off` chat commands.
+- Remove `telegram enable`/`telegram disable` and the `TelegramConfig.enabled` flag: Telegram is always treated as enabled once configured, so the daemon never silently stops polling the channel.
+- Drop `telegramEnabled`/`discordEnabled` from `doctor`, `remote status`, `telegram status`, and the macOS menu bar app.
+- Add a Chinese translation of the README with a language switcher on the repository homepage.
+- Point install, release, and crate metadata URLs at the maintained repository.
+
 ## 0.1.0 - 2026-04-15
 
 Initial OSS release candidate.

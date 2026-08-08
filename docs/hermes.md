@@ -19,7 +19,7 @@ cargo install --path .
 From Git:
 
 ```bash
-cargo install --git https://github.com/hanifcarroll/codex-telegram-bridge
+cargo install --git https://github.com/zhang0098/codex-telegram-bridge
 ```
 
 Verify the bridge can resolve Codex:
